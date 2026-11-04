@@ -9,6 +9,8 @@ from app.case_content import (
     KNOWLEDGE_DECLARATIONS,
 )
 from app.case_engine import action_by_id, resolve_action
+from app.local_simulation import advance_local_simulation
+from app.social_engine import build_social_changes
 
 
 class CaseAuthorizer:
@@ -70,6 +72,8 @@ def prepare_action(
     state: dict,
     model,
     action_id: str | None = None,
+    social_states: list[dict] | None = None,
+    local_plans: list[dict] | None = None,
 ) -> dict:
     """生成不写库、不掷骰的行动计划，显式选择也必须通过 Check。"""
     candidates = candidate_actions(state)
@@ -157,7 +161,9 @@ def prepare_action(
             "selection_reason": selection_reason,
         },
         "declaration": make_declaration(intent, action, state),
-        "mechanical_changes": preview_structured_changes(action, state),
+        "mechanical_changes": preview_structured_changes(
+            action, state, social_states, local_plans
+        ),
         "pipeline": pipeline,
         "permission": permission,
         "case_action": action is not None,
@@ -194,28 +200,50 @@ def make_declaration(intent: dict, action: dict | None, state: dict) -> dict:
     else:
         effect_text = "获得信息，不改变案件机械状态"
     has_clock_cost = any(effect.get("clock_add", 0) for effect in effects)
+    costs = []
+    if has_clock_cost:
+        costs.append("可能推进项目清理时钟")
+    if action.get("time_cost", 0):
+        costs.append(f"消耗 {action['time_cost']} 点游戏内时间")
     return {
         "target": metadata.get("target", action["label"]),
         "method": action["tendency"],
         "position": "有风险，需要公开 2D6" if action["requires_roll"] else "平稳，无需掷骰",
         "effect": effect_text,
-        "cost": "可能推进项目清理时钟" if has_clock_cost else "无机械代价",
+        "cost": "；".join(costs) if costs else "无机械代价",
         "modifier_source": metadata.get("modifier_source", "C01 固定行动修正"),
     }
 
 
-def preview_structured_changes(action: dict | None, state: dict) -> list[dict]:
+def preview_structured_changes(
+    action: dict | None,
+    state: dict,
+    social_states: list[dict] | None = None,
+    local_plans: list[dict] | None = None,
+) -> list[dict]:
     """按判定结果列出预览摘要；此处不分配来源事件或写入数据库。"""
     if action is None:
         return []
-    return [
-        {"outcome": outcome, **build_structured_changes(action, state, outcome)}
-        for outcome in action["effects"]
-    ]
+    previews = []
+    for outcome in action["effects"]:
+        changes = build_structured_changes(
+            action, state, outcome, social_states, local_plans
+        )
+        # 玩家预览只展示公开摘要，完整结构变化由实际提交事务内部使用。
+        changes["social"] = {"public": changes["social"]["public"]}
+        changes["simulation"] = {"public": changes["simulation"]["public"]}
+        previews.append({"outcome": outcome, **changes})
+    return previews
 
 
-def build_structured_changes(action: dict, state: dict, outcome: str) -> dict:
-    """从固定内容计算本次实际事实、Clock 与认知变化。"""
+def build_structured_changes(
+    action: dict,
+    state: dict,
+    outcome: str,
+    social_states: list[dict] | None = None,
+    local_plans: list[dict] | None = None,
+) -> dict:
+    """从固定内容计算事实、时间、认知、社会变化与局部模拟。"""
     effect = action["effects"].get(outcome, {})
     new_clues = [clue for clue in effect.get("clues_add", []) if clue not in state["clues"]]
     facts = [
@@ -254,7 +282,27 @@ def build_structured_changes(action: dict, state: dict, outcome: str) -> dict:
             "before_value": state["clock"],
             "after_value": state["clock"] + delta,
         }
-    return {"facts_add": facts, "clock": clock, "knowledge": knowledge}
+    social_states = social_states or []
+    local_plans = local_plans or []
+    before_time = state.get("world_time", 0)
+    time_cost = action.get("time_cost", 0)
+    after_time = before_time + time_cost
+    social = build_social_changes(
+        action, outcome, after_time, social_states, local_plans
+    )
+    simulation = advance_local_simulation(after_time, social_states, local_plans)
+    return {
+        "facts_add": facts,
+        "clock": clock,
+        "knowledge": knowledge,
+        "world_time": {
+            "before": before_time,
+            "after": after_time,
+            "time_cost": time_cost,
+        },
+        "social": social,
+        "simulation": simulation,
+    }
 
 
 def apply_plan(plan: dict, state: dict, roll: dict | None) -> dict | None:
@@ -263,7 +311,7 @@ def apply_plan(plan: dict, state: dict, roll: dict | None) -> dict | None:
         return None
     action = action_by_id(plan["intent"]["action_id"])
     next_state = resolve_action(state, action, roll["outcome"] if roll else None)
-    keys = ("phase", "location", "clock", "clues", "ending")
+    keys = ("phase", "location", "clock", "world_time", "clues", "ending")
     if all(next_state[key] == state[key] for key in keys):
         return None
     return next_state

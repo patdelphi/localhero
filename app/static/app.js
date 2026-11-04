@@ -30,6 +30,8 @@ const elements = {
   auditList: document.querySelector("#audit-list"),
   toggleAudit: document.querySelector("#toggle-audit"),
   knowledgeList: document.querySelector("#knowledge-list"),
+  planList: document.querySelector("#plan-list"),
+  historyList: document.querySelector("#history-list"),
   hypothesisList: document.querySelector("#hypothesis-list"),
   hypothesisForm: document.querySelector("#hypothesis-form"),
   hypothesisInput: document.querySelector("#hypothesis-input"),
@@ -57,6 +59,16 @@ const holderLabels = {
   shao_qian: "邵谦",
   lin_yanzhou: "林砚舟",
   a_luo: "阿洛",
+};
+
+const historyKindLabels = {
+  relationship: "公开关系",
+  condition: "社会状态",
+  plan: "固定计划",
+};
+
+const planLabels = {
+  fangsheng_followup: "方笙整理旧排班补充",
 };
 
 const accuracyLabels = {
@@ -138,12 +150,19 @@ function renderEvent(event) {
     label.textContent = "案件变化";
     const parts = [`阶段：${phaseLabels[event.payload.phase] || event.payload.phase}`];
     parts.push(`项目清理：${event.payload.clock} / 4`);
+    parts.push(`游戏内时间：${event.payload.world_time ?? 0}`);
     if (event.payload.clues?.length) parts.push(`线索：${event.payload.clues.length} 条`);
     if (event.payload.ending) parts.push(`结局：${event.payload.ending}`);
     body.textContent = parts.join(" · ");
+  } else if (event.kind === "social_changed") {
+    label.textContent = "社会变化";
+    body.textContent = event.payload.changes?.join("；") || "公开社会关系已更新";
+  } else if (event.kind === "local_simulation_advanced") {
+    label.textContent = "局部推进";
+    body.textContent = event.payload.changes?.join("；") || "固定计划或短期状态已到期";
   } else {
     label.textContent = "场景";
-    body.textContent = event.payload.text;
+    body.textContent = event.payload.text || "事件已记录";
   }
   article.append(label, body);
   return article;
@@ -167,8 +186,10 @@ function renderCase(caseState) {
   document.querySelector("#case-location").textContent = `${caseState.location} · ${caseState.district}`;
   document.querySelector("#case-phase").textContent = phaseLabels[caseState.phase] || caseState.phase;
   document.querySelector("#case-clock").textContent = `${caseState.clock} / ${caseState.clock_max}`;
+  document.querySelector("#case-world-time").textContent = caseState.world_time;
   document.querySelector("#case-ending").textContent = caseState.ending || "尚未结案";
   document.querySelector("#case-revision").textContent = caseState.revision;
+  renderPlans(caseState.plans || []);
 
   const clueList = document.querySelector("#clue-list");
   clueList.replaceChildren();
@@ -197,6 +218,46 @@ function renderCase(caseState) {
       elements.actionInput.focus();
     });
     elements.caseActions.appendChild(button);
+  });
+}
+
+function renderPlans(items) {
+  elements.planList.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("li");
+    empty.className = "board-empty";
+    empty.textContent = "暂无公开计划";
+    elements.planList.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const entry = document.createElement("li");
+    const content = document.createElement("p");
+    const meta = document.createElement("small");
+    content.textContent = planLabels[item.plan_id] || item.plan_id;
+    meta.textContent = `${holderLabels[item.holder_id] || item.holder_id} · 到期时间 ${item.due_time} · ${item.status === "completed" ? "已完成" : "待处理"}`;
+    entry.append(content, meta);
+    elements.planList.appendChild(entry);
+  });
+}
+
+function renderHistory(items) {
+  elements.historyList.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("li");
+    empty.className = "board-empty";
+    empty.textContent = "暂无人物履历";
+    elements.historyList.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const entry = document.createElement("li");
+    const content = document.createElement("p");
+    const meta = document.createElement("small");
+    content.textContent = item.content;
+    meta.textContent = `${historyKindLabels[item.kind] || item.kind} · ${holderLabels[item.holder_id] || item.holder_id} · 来源事件 #${item.source_event_id}`;
+    entry.append(content, meta);
+    elements.historyList.appendChild(entry);
   });
 }
 
@@ -265,11 +326,13 @@ function renderHypotheses(items) {
 }
 
 async function loadCaseBoard() {
-  const [knowledge, hypotheses] = await Promise.all([
+  const [knowledge, history, hypotheses] = await Promise.all([
     api(`/api/games/${state.gameId}/knowledge`),
+    api(`/api/games/${state.gameId}/character-history`),
     api(`/api/games/${state.gameId}/hypotheses`),
   ]);
   renderKnowledge(knowledge.items);
+  renderHistory(history.items);
   renderHypotheses(hypotheses.items);
 }
 

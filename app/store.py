@@ -41,7 +41,7 @@ class Database:
                 raise
 
     def initialize(self) -> "Database":
-        """在事务中创建或迁移到版本 3，并启用 WAL。"""
+        """在事务中创建或迁移到版本 4，并启用 WAL。"""
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -64,6 +64,9 @@ class Database:
         needs_v3_backfill = bool(has_game_table and version < 3)
         if needs_v3_backfill:
             self._backup_before_v3()
+        needs_v4_backfill = bool(has_game_table and version < 4)
+        if needs_v4_backfill:
+            self._backup_before_v4()
         schema = (
             """
             CREATE TABLE IF NOT EXISTS games (
@@ -112,6 +115,7 @@ class Database:
                 phase TEXT NOT NULL,
                 location TEXT NOT NULL,
                 clock INTEGER NOT NULL DEFAULT 0,
+                world_time INTEGER NOT NULL DEFAULT 0,
                 clues_json TEXT NOT NULL DEFAULT '[]',
                 ending TEXT,
                 revision INTEGER NOT NULL DEFAULT 0,
@@ -163,6 +167,54 @@ class Database:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS social_states (
+                game_id TEXT NOT NULL REFERENCES games(id),
+                state_id TEXT NOT NULL,
+                holder_id TEXT NOT NULL,
+                target_id TEXT,
+                kind TEXT NOT NULL CHECK(kind IN ('relationship', 'trust', 'condition')),
+                value_int INTEGER,
+                value_text TEXT,
+                visibility TEXT NOT NULL CHECK(visibility IN ('public', 'player', 'private')),
+                starts_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                status TEXT NOT NULL CHECK(status IN ('active', 'ended')),
+                source_event_id INTEGER NOT NULL REFERENCES events(id),
+                ended_event_id INTEGER REFERENCES events(id),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(game_id, state_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS character_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT NOT NULL REFERENCES games(id),
+                holder_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('relationship', 'trust', 'condition', 'social_memory', 'plan')),
+                content TEXT NOT NULL,
+                structured_json TEXT NOT NULL,
+                visibility TEXT NOT NULL CHECK(visibility IN ('public', 'player', 'private')),
+                source_event_id INTEGER NOT NULL REFERENCES events(id),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS local_plans (
+                game_id TEXT NOT NULL REFERENCES games(id),
+                plan_id TEXT NOT NULL,
+                holder_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                due_time INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
+                source_event_id INTEGER NOT NULL REFERENCES events(id),
+                completed_event_id INTEGER REFERENCES events(id),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(game_id, plan_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS player_hypotheses (
                 id TEXT PRIMARY KEY,
                 game_id TEXT NOT NULL REFERENCES games(id),
@@ -174,6 +226,9 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_case_facts_active ON case_facts(game_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_clock_changes_game ON clock_changes(game_id, id)",
             "CREATE INDEX IF NOT EXISTS idx_knowledge_player ON knowledge_records(game_id, visibility, id)",
+            "CREATE INDEX IF NOT EXISTS idx_social_states_game ON social_states(game_id, kind, status)",
+            "CREATE INDEX IF NOT EXISTS idx_character_history_game ON character_history(game_id, visibility, source_event_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_local_plans_due ON local_plans(game_id, status, due_time, plan_id)",
             "CREATE INDEX IF NOT EXISTS idx_hypotheses_game ON player_hypotheses(game_id, created_at)",
         )
         with self.transaction() as conn:
@@ -182,7 +237,9 @@ class Database:
             self._migrate_columns(conn)
             if needs_v3_backfill:
                 self._backfill_v3(conn)
-            conn.execute("PRAGMA user_version=3")
+            if needs_v4_backfill:
+                self._backfill_v4(conn)
+            conn.execute("PRAGMA user_version=4")
         return self
 
     def _backup_before_v2(self) -> None:
@@ -192,6 +249,10 @@ class Database:
     def _backup_before_v3(self) -> None:
         """保留首次升级到 v3 前的一致性快照。"""
         self._backup("pre-v3")
+
+    def _backup_before_v4(self) -> None:
+        """保留首次升级到 v4 前的一致性快照。"""
+        self._backup("pre-v4")
 
     def _backup(self, label: str) -> None:
         """使用 SQLite 在线备份；临时文件完成后原子替换目标。"""
@@ -232,6 +293,10 @@ class Database:
         if "revision" not in case_columns:
             conn.execute(
                 "ALTER TABLE case_states ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
+        if "world_time" not in case_columns:
+            conn.execute(
+                "ALTER TABLE case_states ADD COLUMN world_time INTEGER NOT NULL DEFAULT 0"
             )
         conn.execute(
             """
@@ -317,6 +382,70 @@ class Database:
                 ) VALUES (?, 'project_cleanup', ?, 'v2 到 v3 迁移时快照值', 0, ?, ?)
                 """,
                 (game_id, source_event_id, state["clock"], state["clock"]),
+            )
+
+    @staticmethod
+    def _backfill_v4(conn: sqlite3.Connection) -> None:
+        """旧档仅从有效委托事实回填公开关系，不伪造其他社会历史。"""
+        commissions = conn.execute(
+            """
+            SELECT game_id FROM case_facts
+            WHERE fact_id='commission' AND status='active' ORDER BY game_id
+            """
+        ).fetchall()
+        for commission in commissions:
+            game_id = commission["game_id"]
+            existing = conn.execute(
+                "SELECT 1 FROM events WHERE game_id=? AND kind='legacy_v4_backfill'",
+                (game_id,),
+            ).fetchone()
+            if existing:
+                continue
+            cursor = conn.execute(
+                "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, NULL, ?, ?)",
+                (
+                    game_id,
+                    "legacy_v4_backfill",
+                    json.dumps(
+                        {"world_time": 0, "relationship": "方笙是玩家的委托人"},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            event_id = cursor.lastrowid
+            state_id = "fang_sheng:player:relationship"
+            conn.execute(
+                """
+                INSERT INTO social_states(
+                    game_id, state_id, holder_id, target_id, kind,
+                    value_int, value_text, visibility, starts_at, expires_at,
+                    status, source_event_id
+                ) VALUES (?, ?, 'fang_sheng', 'player', 'relationship',
+                          NULL, '委托人', 'public', 0, NULL, 'active', ?)
+                """,
+                (game_id, state_id, event_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO character_history(
+                    game_id, holder_id, kind, content, structured_json,
+                    visibility, source_event_id
+                ) VALUES (?, 'fang_sheng', 'relationship', '方笙成为你的委托人。',
+                          ?, 'public', ?)
+                """,
+                (
+                    game_id,
+                    json.dumps(
+                        {
+                            "state_id": state_id,
+                            "before": None,
+                            "after": {"value_text": "委托人", "status": "active"},
+                            "legacy_backfill": True,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    event_id,
+                ),
             )
 
     def create_game(self, protagonist: str) -> dict:
@@ -411,6 +540,46 @@ class Database:
                 SELECT * FROM knowledge_records
                 WHERE game_id=? AND visibility='player'
                 ORDER BY source_event_id, rowid
+                """,
+                (game_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_social_states(self, game_id: str) -> list[dict]:
+        """读取社会结构投影；私密字段仅供规则引擎内部使用。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM social_states WHERE game_id=? ORDER BY rowid",
+                (game_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_character_history(
+        self, game_id: str, include_private: bool = False
+    ) -> list[dict]:
+        """按来源事件读取履历；玩家接口默认排除私密记录。"""
+        visibility_sql = "" if include_private else "AND visibility IN ('public', 'player')"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM character_history
+                WHERE game_id=? {visibility_sql}
+                ORDER BY source_event_id, id
+                """,
+                (game_id,),
+            ).fetchall()
+        return [
+            {**dict(row), "structured": json.loads(row["structured_json"])}
+            for row in rows
+        ]
+
+    def get_local_plans(self, game_id: str) -> list[dict]:
+        """按固定到期顺序读取局部计划当前投影。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM local_plans WHERE game_id=?
+                ORDER BY due_time, plan_id
                 """,
                 (game_id,),
             ).fetchall()
@@ -563,6 +732,9 @@ class Database:
                 )
             if case_state:
                 next_revision = current_revision + 1
+                next_world_time = case_state.get(
+                    "world_time", current_case["world_time"] if current_case else 0
+                )
                 conn.execute(
                     "UPDATE games SET location=? WHERE id=?",
                     (case_state["location"], game_id),
@@ -570,12 +742,14 @@ class Database:
                 conn.execute(
                     """
                     INSERT INTO case_states(
-                        game_id, phase, location, clock, clues_json, ending, revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        game_id, phase, location, clock, world_time,
+                        clues_json, ending, revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(game_id) DO UPDATE SET
                         phase=excluded.phase,
                         location=excluded.location,
                         clock=excluded.clock,
+                        world_time=excluded.world_time,
                         clues_json=excluded.clues_json,
                         ending=excluded.ending,
                         revision=excluded.revision,
@@ -586,6 +760,7 @@ class Database:
                         case_state["phase"],
                         case_state["location"],
                         case_state["clock"],
+                        next_world_time,
                         json.dumps(case_state["clues"], ensure_ascii=False),
                         case_state["ending"],
                         next_revision,
@@ -602,6 +777,7 @@ class Database:
                                 "phase": case_state["phase"],
                                 "location": case_state["location"],
                                 "clock": case_state["clock"],
+                                "world_time": next_world_time,
                                 "clues": list(case_state["clues"]),
                                 "ending": case_state["ending"],
                                 "revision": next_revision,
@@ -609,6 +785,17 @@ class Database:
                             ensure_ascii=False,
                         ),
                     ),
+                )
+            if structured_changes is not None:
+                self._apply_social_changes(
+                    conn, game_id, action_id, structured_changes.get("social", {})
+                )
+                self._apply_simulation_changes(
+                    conn,
+                    game_id,
+                    action_id,
+                    structured_changes.get("simulation", {}),
+                    structured_changes.get("world_time", {}).get("after", 0),
                 )
         return self.get_action(game_id, action_id)
 
@@ -630,6 +817,19 @@ class Database:
 
         old_clues = set(json.loads(current_case["clues_json"])) if current_case else set()
         old_clock = current_case["clock"] if current_case else 0
+        world_time = changes.get("world_time")
+        if world_time is not None:
+            old_world_time = current_case["world_time"] if current_case else 0
+            actual_world_time = (
+                case_state.get("world_time", old_world_time)
+                if case_state is not None else old_world_time
+            )
+            if (
+                world_time["before"] != old_world_time
+                or world_time["after"] != actual_world_time
+                or world_time["before"] + world_time["time_cost"] != world_time["after"]
+            ):
+                raise ValueError("游戏时间前后值、耗时与案件投影不一致")
         if case_state is not None:
             new_clues = set(case_state["clues"])
             if set(fact["fact_id"] for fact in facts) != new_clues - old_clues:
@@ -711,6 +911,211 @@ class Database:
                     record["visibility"],
                 ),
             )
+
+    @staticmethod
+    def _insert_history(
+        conn: sqlite3.Connection,
+        game_id: str,
+        source_event_id: int,
+        record: dict,
+    ) -> None:
+        """写入同源履历，并在数据库约束前给出可读的领域异常。"""
+        allowed_kinds = {"relationship", "trust", "condition", "social_memory", "plan"}
+        if record.get("kind") not in allowed_kinds:
+            raise ValueError("履历类型非法")
+        if record.get("visibility") not in {"public", "player", "private"}:
+            raise ValueError("履历可见性非法")
+        conn.execute(
+            """
+            INSERT INTO character_history(
+                game_id, holder_id, kind, content, structured_json,
+                visibility, source_event_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                game_id,
+                record["holder_id"],
+                record["kind"],
+                record["content"],
+                json.dumps(record.get("structured", {}), ensure_ascii=False),
+                record["visibility"],
+                source_event_id,
+            ),
+        )
+
+    @staticmethod
+    def _apply_social_changes(
+        conn: sqlite3.Connection,
+        game_id: str,
+        action_id: str,
+        social: dict,
+    ) -> None:
+        """社会状态、履历和计划共享一个非私密摘要事件来源。"""
+        states = social.get("states", [])
+        history = social.get("history", [])
+        plans = social.get("plans", [])
+        if not (states or history or plans):
+            return
+        cursor = conn.execute(
+            "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, ?, ?, ?)",
+            (
+                game_id,
+                action_id,
+                "social_changed",
+                json.dumps({"changes": social.get("public", [])}, ensure_ascii=False),
+            ),
+        )
+        event_id = cursor.lastrowid
+        for state in states:
+            kind = state.get("kind")
+            if kind not in {"relationship", "trust", "condition"}:
+                raise ValueError("社会状态类型非法")
+            if kind == "trust" and (
+                not isinstance(state.get("value_int"), int)
+                or not -2 <= state["value_int"] <= 2
+            ):
+                raise ValueError("信任值必须位于 -2 至 +2")
+            if kind == "condition" and state.get("expires_at") is None:
+                raise ValueError("短期社会状态必须有到期时间")
+            if state.get("visibility") not in {"public", "player", "private"}:
+                raise ValueError("社会状态可见性非法")
+            conn.execute(
+                """
+                INSERT INTO social_states(
+                    game_id, state_id, holder_id, target_id, kind,
+                    value_int, value_text, visibility, starts_at, expires_at,
+                    status, source_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    game_id,
+                    state["state_id"],
+                    state["holder_id"],
+                    state.get("target_id"),
+                    kind,
+                    state.get("value_int"),
+                    state.get("value_text"),
+                    state["visibility"],
+                    state["starts_at"],
+                    state.get("expires_at"),
+                    state.get("status", "active"),
+                    event_id,
+                ),
+            )
+        for record in history:
+            Database._insert_history(conn, game_id, event_id, record)
+        for plan in plans:
+            if plan.get("status") != "pending" or not isinstance(plan.get("due_time"), int):
+                raise ValueError("固定计划状态或到期时间非法")
+            conn.execute(
+                """
+                INSERT INTO local_plans(
+                    game_id, plan_id, holder_id, scope, due_time,
+                    status, source_event_id
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    game_id,
+                    plan["plan_id"],
+                    plan["holder_id"],
+                    plan["scope"],
+                    plan["due_time"],
+                    event_id,
+                ),
+            )
+
+    @staticmethod
+    def _apply_simulation_changes(
+        conn: sqlite3.Connection,
+        game_id: str,
+        action_id: str,
+        simulation: dict,
+        after_time: int,
+    ) -> None:
+        """只有真实到期事项才生成局部模拟事件及其同源产物。"""
+        plans = simulation.get("plans", [])
+        states = simulation.get("states", [])
+        knowledge = simulation.get("knowledge", [])
+        history = simulation.get("history", [])
+        if not (plans or states or knowledge or history):
+            return
+        cursor = conn.execute(
+            "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, ?, ?, ?)",
+            (
+                game_id,
+                action_id,
+                "local_simulation_advanced",
+                json.dumps(
+                    {
+                        "world_time": after_time,
+                        "completed_plans": [item["plan_id"] for item in plans],
+                        "ended_states": [item["state_id"] for item in states],
+                        "changes": simulation.get("public", []),
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        event_id = cursor.lastrowid
+        for plan in plans:
+            current = conn.execute(
+                "SELECT * FROM local_plans WHERE game_id=? AND plan_id=?",
+                (game_id, plan["plan_id"]),
+            ).fetchone()
+            if (
+                current is None or current["status"] != "pending"
+                or current["due_time"] > after_time or plan.get("status") != "completed"
+            ):
+                raise ValueError("计划到期时间与当前投影不一致")
+            conn.execute(
+                """
+                UPDATE local_plans SET status='completed', completed_event_id=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE game_id=? AND plan_id=?
+                """,
+                (event_id, game_id, plan["plan_id"]),
+            )
+        for state in states:
+            current = conn.execute(
+                "SELECT * FROM social_states WHERE game_id=? AND state_id=?",
+                (game_id, state["state_id"]),
+            ).fetchone()
+            if (
+                current is None or current["status"] != "active"
+                or current["expires_at"] is None or current["expires_at"] > after_time
+                or state.get("status") != "ended"
+            ):
+                raise ValueError("短期状态到期时间与当前投影不一致")
+            conn.execute(
+                """
+                UPDATE social_states SET status='ended', ended_event_id=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE game_id=? AND state_id=?
+                """,
+                (event_id, game_id, state["state_id"]),
+            )
+        for record in knowledge:
+            conn.execute(
+                """
+                INSERT INTO knowledge_records(
+                    id, game_id, holder_id, kind, source_event_id,
+                    fact_id, content, accuracy, visibility
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    game_id,
+                    record["holder_id"],
+                    record["kind"],
+                    event_id,
+                    record.get("fact_id"),
+                    record["content"],
+                    record["accuracy"],
+                    record["visibility"],
+                ),
+            )
+        for record in history:
+            Database._insert_history(conn, game_id, event_id, record)
 
     def get_action(self, game_id: str, action_id: str) -> dict:
         """读取行动并反序列化已保存的协议、判定、审计和响应。"""
@@ -809,6 +1214,19 @@ class Database:
         result = []
         for row in rows:
             action = self._decode_action(row)
+            audit = action["audit"]
+            structured = audit.get("structured_changes") or {}
+            social = structured.get("social")
+            if social:
+                # 审计接口同样是玩家视图，私密信任与记忆只保存在内部记录中。
+                social["states"] = [
+                    item for item in social.get("states", [])
+                    if item.get("visibility") in {"public", "player"}
+                ]
+                social["history"] = [
+                    item for item in social.get("history", [])
+                    if item.get("visibility") in {"public", "player"}
+                ]
             result.append(
                 {
                     "action_id": action["id"],

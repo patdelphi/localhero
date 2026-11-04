@@ -11,6 +11,7 @@ def initial_state() -> dict:
         "phase": "unoffered",
         "location": "OC-01",
         "clock": 0,
+        "world_time": 0,
         "clues": [],
         "ending": None,
         "revision": 0,
@@ -47,6 +48,7 @@ def resolve_action(state: dict, action: dict, roll_outcome: str | None) -> dict:
             next_state["clues"].append(clue)
 
     next_state["clock"] += effect.get("clock_add", 0)
+    next_state["world_time"] = next_state.get("world_time", 0) + action.get("time_cost", 0)
     if "location_to" in effect:
         next_state["location"] = effect["location_to"]
     if "phase_to" in effect:
@@ -64,8 +66,8 @@ def action_by_id(action_id: str) -> dict:
     raise KeyError("案件行动不存在")
 
 
-def public_state(state: dict) -> dict:
-    """返回给前端展示的案件状态，不暴露主持人秘密或未声明事实。"""
+def public_state(state: dict, plans: list[dict] | None = None) -> dict:
+    """返回公开案件状态、时间和计划，不包含任何私密社会状态。"""
     return {
         "phase": state["phase"],
         "location": state["location"],
@@ -73,6 +75,16 @@ def public_state(state: dict) -> dict:
         "district": LOCATIONS[state["location"]]["district"],
         "clock": state["clock"],
         "clock_max": 4,
+        "world_time": state.get("world_time", 0),
+        "plans": [
+            {
+                "plan_id": plan["plan_id"],
+                "holder_id": plan["holder_id"],
+                "due_time": plan["due_time"],
+                "status": plan["status"],
+            }
+            for plan in (plans or [])
+        ],
         "clues": [{"id": clue, "label": CLUE_LABELS[clue]} for clue in state["clues"]],
         "ending": ENDINGS.get(state["ending"]) if state["ending"] else None,
         "revision": state.get("revision", 0),

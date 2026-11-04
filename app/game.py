@@ -46,7 +46,7 @@ class GameService:
         case = self.db.get_case_state(game_id)
         return {
             "game": game,
-            "case": public_state(case),
+            "case": public_state(case, self.db.get_local_plans(game_id)),
             "events": self.db.get_events(game_id),
         }
 
@@ -60,7 +60,11 @@ class GameService:
         with self._lock:
             self.db.get_game(game_id)
             case_state = self.db.get_case_state(game_id)
-            plan = prepare_action(action_text, case_state, self.model, action_id)
+            social_states = self.db.get_social_states(game_id)
+            local_plans = self.db.get_local_plans(game_id)
+            plan = prepare_action(
+                action_text, case_state, self.model, action_id, social_states, local_plans
+            )
             return {
                 "revision": case_state["revision"],
                 "rules_version": RULES_VERSION,
@@ -113,7 +117,11 @@ class GameService:
                 and case_state["revision"] != expected_revision
             ):
                 raise StateConflict("案件状态已变化，请重新预览")
-            plan = prepare_action(action_text, case_state, self.model, action_id)
+            social_states = self.db.get_social_states(game_id)
+            local_plans = self.db.get_local_plans(game_id)
+            plan = prepare_action(
+                action_text, case_state, self.model, action_id, social_states, local_plans
+            )
             if not plan["can_submit"]:
                 raise PermissionDenied(plan["reason"] or "行动未通过程序审核")
 
@@ -128,7 +136,7 @@ class GameService:
                 action_content = action_by_id(plan["intent"]["action_id"])
                 outcome = roll["outcome"] if roll else "no_roll"
                 structured_changes = build_structured_changes(
-                    action_content, case_state, outcome
+                    action_content, case_state, outcome, social_states, local_plans
                 )
             audit = make_audit(
                 plan, game, case_state, roll, next_case_state, structured_changes
@@ -162,6 +170,11 @@ class GameService:
         """返回玩家可见认知，不提供任意人物私密知识查询参数。"""
         self.db.get_game(game_id)
         return {"items": self.db.get_player_knowledge(game_id)}
+
+    def get_character_history(self, game_id: str) -> dict:
+        """只返回公开或明确授予玩家的人物履历。"""
+        self.db.get_game(game_id)
+        return {"items": self.db.get_character_history(game_id)}
 
     def get_hypotheses(self, game_id: str) -> dict:
         """读取当前存档的玩家假设。"""
@@ -214,4 +227,7 @@ class GameService:
     def _with_case(self, response: dict, game_id: str) -> dict:
         """附带当前案件公开状态，方便前端刷新地点、线索、时钟和版本。"""
         case_state = self.db.get_case_state(game_id)
-        return {**response, "case": public_state(case_state)}
+        return {
+            **response,
+            "case": public_state(case_state, self.db.get_local_plans(game_id)),
+        }

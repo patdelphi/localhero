@@ -4,6 +4,14 @@ CONTENT_VERSION = "c01-1.1"
 
 # 行动前声明只补充展示元数据，机械后果仍由下方固定 effects 唯一决定。
 ACTION_METADATA = {
+    "accept_commission": {
+        "target": "方笙与失踪的苗雨",
+        "effect": "接受委托并建立公开委托关系",
+    },
+    "reassure_fangsheng": {
+        "target": "方笙与苗雨的安全承诺",
+        "effect": "方笙态度缓和，并建立公开补充计划",
+    },
     "check_shared_account": {
         "target": "新栖公寓项目共享排班",
         "effect": "确认共享账户，坏骰仍保留核心证据并可能暴露风险警告",
@@ -139,6 +147,21 @@ KNOWLEDGE_DECLARATIONS = {
     }],
 }
 
+# 固定局部计划只声明到期产物，不允许模型提供任意效果。
+LOCAL_PLAN_DEFINITIONS = {
+    "fangsheng_followup": {
+        "testimony": {
+            "holder_id": "fang_sheng",
+            "kind": "testimony",
+            "fact_id": None,
+            "content": "方笙补充了旧排班中的共享账户备注。",
+            "accuracy": "honest",
+            "visibility": "player",
+        },
+        "history": "方笙补充了旧排班中的共享账户备注。",
+    },
+}
+
 ENDINGS = {
     "personal_review": "低调个人复核",
     "collective_review": "提交集体证据",
@@ -190,6 +213,21 @@ ACTIONS = [
         "effects": {"no_roll": {}},
         "narratives": {
             "no_roll": "方笙说苗雨的宁证还能显示姓名，却过不了工作和支付验证；三天前她在旧城区晕倒，之后只收到一句自动短讯：‘我很好，不要再找。’",
+        },
+    },
+    {
+        "id": "reassure_fangsheng",
+        "label": "安抚方笙",
+        "aliases": ["安抚方笙", "安慰方笙", "承诺优先确认苗雨安全"],
+        "location": "OC-01",
+        "phases": ["active"],
+        "requires_clues": ["commission"],
+        "requires_roll": False,
+        "tendency": "共情",
+        "modifier": 0,
+        "effects": {"no_roll": {}},
+        "narratives": {
+            "no_roll": "你承诺优先确认苗雨安全。方笙绷紧的肩膀稍稍放松，答应整理旧排班里没来得及说明的备注。",
         },
     },
     {
@@ -448,3 +486,14 @@ ACTIONS = [
         },
     },
 ]
+
+# 只有明确声明的移动、调查和社交行动消耗一点游戏内时间。
+TIME_COST_ACTIONS = {
+    "travel_hc07", "travel_oc03", "travel_lg05", "travel_oc01",
+    "inspect_fangsheng_room", "request_project_export", "check_shared_account",
+    "confront_shaoqian", "ask_anonymous_patient", "check_freight_record",
+    "contact_miaoyu", "reassure_fangsheng",
+}
+for _action in ACTIONS:
+    if _action["id"] in TIME_COST_ACTIONS:
+        _action["time_cost"] = 1

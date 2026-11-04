@@ -122,10 +122,11 @@ button:hover:not(:disabled) { filter: brightness(1.1); }
 .clue-list li::before { content: "▸ "; color: var(--accent); }
 .empty-clue { color: var(--muted); }
 .board-note { margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.7; }
-.knowledge-list, .hypothesis-list { list-style: none; margin: 0; padding: 0; }
-.knowledge-list li, .hypothesis-list li { padding: 12px 0; border-bottom: 1px dotted var(--line); }
-.knowledge-list p, .hypothesis-list p { margin: 0 0 6px; color: #d5d3c8; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
-.knowledge-list small { color: var(--muted); font-size: 10px; line-height: 1.6; }
+.knowledge-list, .hypothesis-list, .plan-list, .history-list { list-style: none; margin: 0; padding: 0; }
+.knowledge-list li, .hypothesis-list li, .plan-list li, .history-list li { padding: 12px 0; border-bottom: 1px dotted var(--line); }
+.knowledge-list p, .hypothesis-list p, .plan-list p, .history-list p { margin: 0 0 6px; color: #d5d3c8; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+.knowledge-list small, .plan-list small, .history-list small { color: var(--muted); font-size: 10px; line-height: 1.6; }
+.history-list { margin-top: 12px; }
 .board-empty { color: var(--muted); font-size: 12px; }
 .hypothesis-form textarea { min-height: 68px; padding: 10px; font-size: 12px; }
 .hypothesis-controls, .hypothesis-item-controls { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 8px; }

@@ -88,6 +88,10 @@ def create_app(db_path: str | Path, model: SimulatedModel | None = None) -> Fast
     def get_knowledge(game_id: str):
         return service.get_knowledge(game_id)
 
+    @app.get("/api/games/{game_id}/character-history")
+    def get_character_history(game_id: str):
+        return service.get_character_history(game_id)
+
     @app.get("/api/games/{game_id}/hypotheses")
     def get_hypotheses(game_id: str):
         return service.get_hypotheses(game_id)
