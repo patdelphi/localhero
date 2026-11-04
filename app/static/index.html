@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>灰区事务所 · C01 本地切片</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">临潮市 · 旧城区 · 2060</p>
+      <h1>灰区事务所</h1>
+    </div>
+    <div class="system-state">
+      <span class="status-dot" aria-hidden="true"></span>
+      模拟模型 · 无网络调用
+    </div>
+  </header>
+
+  <main>
+    <section id="entry-panel" class="entry-panel" aria-labelledby="entry-title">
+      <p class="section-index">CASEWORK / C01</p>
+      <h2 id="entry-title">打开事务所</h2>
+      <p class="entry-copy">这是 C01《不存在的人》的本地可玩切片。程序掌握案件真相、线索、地点和时钟；叙事文字由本地确定性模拟生成，不调用任何 AI Provider。</p>
+      <div class="entry-grid">
+        <form id="new-game-form" class="entry-form">
+          <label for="protagonist">主人公姓名</label>
+          <div class="inline-control">
+            <input id="protagonist" name="protagonist" value="江逢" maxlength="40" required>
+            <button type="submit">新建存档</button>
+          </div>
+        </form>
+        <form id="load-game-form" class="entry-form">
+          <label for="load-id">读取已有存档</label>
+          <div class="inline-control">
+            <input id="load-id" name="load-id" placeholder="输入存档编号" required>
+            <button type="submit" class="secondary">读取</button>
+          </div>
+        </form>
+      </div>
+      <p id="entry-error" class="error" role="alert"></p>
+    </section>
+
+    <section id="game-panel" class="game-panel" hidden>
+      <div class="game-meta">
+        <div>
+          <span class="section-index" id="location-index">LOCATION / OC-01</span>
+          <strong id="location-name">灰区事务所</strong>
+        </div>
+        <div class="save-reference">
+          <span id="save-status">已自动保存</span>
+          <code id="game-id"></code>
+          <button id="copy-id" class="text-button" type="button">复制编号</button>
+          <button id="return-entry" class="text-button" type="button">切换存档</button>
+        </div>
+      </div>
+
+      <div class="play-layout">
+        <section class="scene-column" aria-labelledby="scene-title">
+          <div class="column-heading">
+            <h2 id="scene-title">当前场景</h2>
+            <span>事件按提交顺序记录</span>
+          </div>
+          <div id="scene-log" class="scene-log" aria-live="polite"></div>
+        </section>
+
+        <aside class="context-column" aria-label="即时局势">
+          <section class="context-block">
+            <p class="section-index">在场人物</p>
+            <div class="person">
+              <span class="person-mark">唐</span>
+              <div><strong>唐葵</strong><small>固定同伴 · 案件板旁</small></div>
+            </div>
+            <div class="person">
+              <span class="person-mark protagonist-mark" id="protagonist-mark">江</span>
+              <div><strong id="protagonist-name">江逢</strong><small>事务所负责人</small></div>
+            </div>
+          </section>
+          <section class="context-block">
+            <p class="section-index">可见状态</p>
+            <ul class="state-list">
+              <li><span>位置</span><strong id="case-location">OC-01</strong></li>
+              <li><span>阶段</span><strong id="case-phase">未接单</strong></li>
+              <li><span>项目清理</span><strong id="case-clock">0 / 4</strong></li>
+              <li><span>已判定</span><strong id="roll-count">0 次</strong></li>
+              <li><span>状态版本</span><strong id="case-revision">0</strong></li>
+            </ul>
+          </section>
+          <section class="context-block">
+            <p class="section-index">已知线索</p>
+            <ul id="clue-list" class="clue-list"></ul>
+          </section>
+          <section class="context-block">
+            <p class="section-index">案件结局</p>
+            <p id="case-ending" class="ending-text">尚未结案</p>
+          </section>
+          <section class="context-block pressure-block">
+            <p class="section-index">事务所压力</p>
+            <p>月租 2800 宁元<br>设备分期 14000 宁元</p>
+          </section>
+        </aside>
+      </div>
+
+      <section class="action-dock" aria-labelledby="action-title">
+        <div class="column-heading">
+          <h2 id="action-title">下一步行动</h2>
+          <span id="action-state">等待输入</span>
+        </div>
+        <div id="roll-result" class="roll-result" hidden></div>
+        <div class="suggestions" id="case-actions" aria-label="当前可用行动"></div>
+        <form id="action-form">
+          <label class="sr-only" for="action-input">自由行动</label>
+          <textarea id="action-input" rows="3" maxlength="2000" placeholder="输入任何合理行动。三个建议不具有额外特权。" required></textarea>
+          <div class="action-buttons">
+            <button id="submit-action" class="submit-action" type="submit">预览行动</button>
+            <button id="retry-action" class="submit-action" type="button" hidden>重试叙事</button>
+          </div>
+        </form>
+        <section id="action-preview" class="action-preview" aria-labelledby="preview-title" hidden>
+          <div class="column-heading">
+            <h3 id="preview-title">确认行动声明</h3>
+            <span id="preview-revision"></span>
+          </div>
+          <dl id="preview-declaration" class="declaration-grid"></dl>
+          <p id="preview-reason" class="preview-reason"></p>
+          <div class="action-buttons">
+            <button id="cancel-action" class="secondary" type="button">取消</button>
+            <button id="confirm-action" type="button">确认并提交</button>
+          </div>
+        </section>
+        <p id="action-error" class="error" role="alert"></p>
+      </section>
+
+      <section class="audit-dock" aria-labelledby="audit-title">
+        <div class="column-heading">
+          <h2 id="audit-title">行动审计</h2>
+          <button id="toggle-audit" class="text-button" type="button" aria-expanded="false">查看只读审计</button>
+        </div>
+        <div id="audit-panel" hidden>
+          <p class="audit-note">候选、排除、权限、随机和事件均来自已保存记录；旧数据只显示 legacy 缺口。</p>
+          <div id="audit-list" class="audit-list"></div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer>事实先于叙事 · 骰点与事件由程序保存 · 当前版本仅用于最小闭环测试</footer>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
