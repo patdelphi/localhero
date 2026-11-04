@@ -1,7 +1,13 @@
 """程序说明：实现候选过滤、Before/Instead/Check、权限审核和有界 After 规划。"""
 
 from app.action_protocol import PermissionDenied, RULES_VERSION
-from app.case_content import ACTIONS, CONTENT_VERSION, ACTION_METADATA
+from app.case_content import (
+    ACTIONS,
+    ACTION_METADATA,
+    CLUE_LABELS,
+    CONTENT_VERSION,
+    KNOWLEDGE_DECLARATIONS,
+)
 from app.case_engine import action_by_id, resolve_action
 
 
@@ -151,6 +157,7 @@ def prepare_action(
             "selection_reason": selection_reason,
         },
         "declaration": make_declaration(intent, action, state),
+        "mechanical_changes": preview_structured_changes(action, state),
         "pipeline": pipeline,
         "permission": permission,
         "case_action": action is not None,
@@ -197,6 +204,59 @@ def make_declaration(intent: dict, action: dict | None, state: dict) -> dict:
     }
 
 
+def preview_structured_changes(action: dict | None, state: dict) -> list[dict]:
+    """按判定结果列出预览摘要；此处不分配来源事件或写入数据库。"""
+    if action is None:
+        return []
+    return [
+        {"outcome": outcome, **build_structured_changes(action, state, outcome)}
+        for outcome in action["effects"]
+    ]
+
+
+def build_structured_changes(action: dict, state: dict, outcome: str) -> dict:
+    """从固定内容计算本次实际事实、Clock 与认知变化。"""
+    effect = action["effects"].get(outcome, {})
+    new_clues = [clue for clue in effect.get("clues_add", []) if clue not in state["clues"]]
+    facts = [
+        {
+            "fact_id": clue,
+            "subject_id": "C01",
+            "fact_kind": "clue",
+            "visibility": "player",
+            "mechanical": {"grants_action_permission": True},
+        }
+        for clue in new_clues
+    ]
+    knowledge = [
+        {
+            "holder_id": "player",
+            "kind": "observation",
+            "fact_id": clue,
+            "content": CLUE_LABELS[clue],
+            "accuracy": "direct",
+            "visibility": "player",
+        }
+        for clue in new_clues
+    ]
+    for declaration in KNOWLEDGE_DECLARATIONS.get(action["id"], []):
+        if outcome in declaration["outcomes"]:
+            knowledge.append(
+                {key: value for key, value in declaration.items() if key != "outcomes"}
+            )
+    delta = effect.get("clock_add", 0)
+    clock = None
+    if delta:
+        clock = {
+            "clock_id": "project_cleanup",
+            "reason": f"{action['id']}:{outcome}",
+            "delta": delta,
+            "before_value": state["clock"],
+            "after_value": state["clock"] + delta,
+        }
+    return {"facts_add": facts, "clock": clock, "knowledge": knowledge}
+
+
 def apply_plan(plan: dict, state: dict, roll: dict | None) -> dict | None:
     """纯计算主结果；没有案件变化时返回 None，After 不另造行动。"""
     if not plan["case_action"]:
@@ -215,6 +275,7 @@ def make_audit(
     state: dict,
     roll: dict | None,
     next_state: dict | None,
+    structured_changes: dict | None = None,
 ) -> dict:
     """把计划、权限和已发生的纯判定组成可持久化审计。"""
     after_revision = state["revision"] + (1 if next_state else 0)
@@ -233,6 +294,7 @@ def make_audit(
         "selected_action": plan["selected_action"],
         "pipeline": plan["pipeline"],
         "declaration": plan["declaration"],
+        "structured_changes": structured_changes,
         "permission": plan["permission"],
         "random": random_audit,
         "state_revision": {"before": state["revision"], "after": after_revision},

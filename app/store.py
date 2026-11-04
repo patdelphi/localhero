@@ -41,7 +41,7 @@ class Database:
                 raise
 
     def initialize(self) -> "Database":
-        """在事务中创建或迁移到版本 2，并启用 WAL。"""
+        """在事务中创建或迁移到版本 3，并启用 WAL。"""
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -54,13 +54,16 @@ class Database:
             case_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(case_states)").fetchall()
             }
-        # 已有存档在首次升级到 v2 前备份；新建空库不制造无意义副本。
+        # 每次跨版本升级都保留独立快照；已有备份绝不覆盖。
         if has_game_table and (
             version < 2
             or "request_hash" not in action_columns
             or "revision" not in case_columns
         ):
             self._backup_before_v2()
+        needs_v3_backfill = bool(has_game_table and version < 3)
+        if needs_v3_backfill:
+            self._backup_before_v3()
         schema = (
             """
             CREATE TABLE IF NOT EXISTS games (
@@ -115,17 +118,84 @@ class Database:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS case_facts (
+                game_id TEXT NOT NULL REFERENCES games(id),
+                fact_id TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                fact_kind TEXT NOT NULL,
+                source_event_id INTEGER NOT NULL REFERENCES events(id),
+                visibility TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('active', 'invalidated')),
+                mechanical_json TEXT NOT NULL,
+                invalidated_event_id INTEGER REFERENCES events(id),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(game_id, fact_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS clock_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT NOT NULL REFERENCES games(id),
+                clock_id TEXT NOT NULL,
+                source_event_id INTEGER NOT NULL REFERENCES events(id),
+                reason TEXT NOT NULL,
+                delta INTEGER NOT NULL,
+                before_value INTEGER NOT NULL,
+                after_value INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, clock_id, source_event_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_records (
+                id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL REFERENCES games(id),
+                holder_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('observation', 'memory', 'testimony')),
+                source_event_id INTEGER NOT NULL REFERENCES events(id),
+                fact_id TEXT,
+                content TEXT NOT NULL,
+                accuracy TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(game_id, fact_id) REFERENCES case_facts(game_id, fact_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS player_hypotheses (
+                id TEXT PRIMARY KEY,
+                game_id TEXT NOT NULL REFERENCES games(id),
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_case_facts_active ON case_facts(game_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_clock_changes_game ON clock_changes(game_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_knowledge_player ON knowledge_records(game_id, visibility, id)",
+            "CREATE INDEX IF NOT EXISTS idx_hypotheses_game ON player_hypotheses(game_id, created_at)",
         )
         with self.transaction() as conn:
             for statement in schema:
                 conn.execute(statement)
             self._migrate_columns(conn)
-            conn.execute("PRAGMA user_version=2")
+            if needs_v3_backfill:
+                self._backfill_v3(conn)
+            conn.execute("PRAGMA user_version=3")
         return self
 
     def _backup_before_v2(self) -> None:
-        """用 SQLite 在线备份保留迁移前一致性快照，绝不覆盖既有备份。"""
-        backup_path = self.path.with_name(self.path.name + ".pre-v2.bak")
+        """保留首次升级到 v2 前的一致性快照。"""
+        self._backup("pre-v2")
+
+    def _backup_before_v3(self) -> None:
+        """保留首次升级到 v3 前的一致性快照。"""
+        self._backup("pre-v3")
+
+    def _backup(self, label: str) -> None:
+        """使用 SQLite 在线备份；临时文件完成后原子替换目标。"""
+        backup_path = self.path.with_name(f"{self.path.name}.{label}.bak")
         if backup_path.exists():
             return
         temporary_path = self.path.with_name(
@@ -171,6 +241,83 @@ class Database:
             WHERE audit_json IS NULL
             """
         )
+
+    @staticmethod
+    def _backfill_v3(conn: sqlite3.Connection) -> None:
+        """只回填旧档当前快照，不伪造已经不可考的历史增减与感知过程。"""
+        from app.case_content import CLUE_LABELS
+
+        states = conn.execute("SELECT * FROM case_states ORDER BY game_id").fetchall()
+        for state in states:
+            game_id = state["game_id"]
+            existing = conn.execute(
+                "SELECT 1 FROM events WHERE game_id=? AND kind='legacy_v3_backfill'",
+                (game_id,),
+            ).fetchone()
+            if existing:
+                continue
+            clues = json.loads(state["clues_json"])
+            cursor = conn.execute(
+                "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, NULL, ?, ?)",
+                (
+                    game_id,
+                    "legacy_v3_backfill",
+                    json.dumps(
+                        {
+                            "phase": state["phase"],
+                            "location": state["location"],
+                            "clock": state["clock"],
+                            "clues": clues,
+                            "ending": state["ending"],
+                            "revision": state["revision"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            source_event_id = cursor.lastrowid
+            for clue in clues:
+                conn.execute(
+                    """
+                    INSERT INTO case_facts(
+                        game_id, fact_id, subject_id, fact_kind, source_event_id,
+                        visibility, status, mechanical_json
+                    ) VALUES (?, ?, 'C01', 'clue', ?, 'player', 'active', ?)
+                    """,
+                    (
+                        game_id,
+                        clue,
+                        source_event_id,
+                        json.dumps(
+                            {"legacy_snapshot": True, "grants_action_permission": True},
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_records(
+                        id, game_id, holder_id, kind, source_event_id,
+                        fact_id, content, accuracy, visibility
+                    ) VALUES (?, ?, 'player', 'memory', ?, ?, ?, 'unknown', 'player')
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        game_id,
+                        source_event_id,
+                        clue,
+                        f"迁移时已知：{CLUE_LABELS.get(clue, clue)}",
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT INTO clock_changes(
+                    game_id, clock_id, source_event_id, reason,
+                    delta, before_value, after_value
+                ) VALUES (?, 'project_cleanup', ?, 'v2 到 v3 迁移时快照值', 0, ?, ?)
+                """,
+                (game_id, source_event_id, state["clock"], state["clock"]),
+            )
 
     def create_game(self, protagonist: str) -> dict:
         """创建固定于 OC-01 的新存档，并写入开场事件。"""
@@ -227,6 +374,101 @@ class Database:
             for row in rows
         ]
 
+    def get_case_facts(self, game_id: str) -> list[dict]:
+        """读取事实及来源事件类型；失效历史仍保留。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.*, e.kind AS source_kind
+                FROM case_facts f JOIN events e ON e.id=f.source_event_id
+                WHERE f.game_id=? ORDER BY f.rowid
+                """,
+                (game_id,),
+            ).fetchall()
+        return [
+            {**dict(row), "mechanical": json.loads(row["mechanical_json"])}
+            for row in rows
+        ]
+
+    def get_clock_changes(self, game_id: str) -> list[dict]:
+        """按提交顺序读取 Clock 变化及来源事件。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.*, e.kind AS source_kind
+                FROM clock_changes c JOIN events e ON e.id=c.source_event_id
+                WHERE c.game_id=? ORDER BY c.id
+                """,
+                (game_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_player_knowledge(self, game_id: str) -> list[dict]:
+        """只返回明确授权给玩家的观察、记忆与证词。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM knowledge_records
+                WHERE game_id=? AND visibility='player'
+                ORDER BY source_event_id, rowid
+                """,
+                (game_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def invalidate_fact(self, game_id: str, fact_id: str, reason: str) -> None:
+        """追加失效事件并同步投影；事实和来源历史不会被删除。"""
+        with self.transaction() as conn:
+            fact = conn.execute(
+                "SELECT * FROM case_facts WHERE game_id=? AND fact_id=? AND status='active'",
+                (game_id, fact_id),
+            ).fetchone()
+            case = conn.execute(
+                "SELECT * FROM case_states WHERE game_id=?", (game_id,)
+            ).fetchone()
+            if fact is None or case is None:
+                raise KeyError("有效事实或案件不存在")
+            cursor = conn.execute(
+                "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, NULL, ?, ?)",
+                (
+                    game_id,
+                    "fact_invalidated",
+                    json.dumps({"fact_id": fact_id, "reason": reason}, ensure_ascii=False),
+                ),
+            )
+            event_id = cursor.lastrowid
+            conn.execute(
+                """
+                UPDATE case_facts SET status='invalidated', invalidated_event_id=?
+                WHERE game_id=? AND fact_id=?
+                """,
+                (event_id, game_id, fact_id),
+            )
+            clues = [clue for clue in json.loads(case["clues_json"]) if clue != fact_id]
+            revision = case["revision"] + 1
+            conn.execute(
+                """
+                UPDATE case_states SET clues_json=?, revision=?, updated_at=CURRENT_TIMESTAMP
+                WHERE game_id=?
+                """,
+                (json.dumps(clues, ensure_ascii=False), revision, game_id),
+            )
+            conn.execute(
+                "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, NULL, ?, ?)",
+                (
+                    game_id,
+                    "case_changed",
+                    json.dumps(
+                        {
+                            "phase": case["phase"], "location": case["location"],
+                            "clock": case["clock"], "clues": clues,
+                            "ending": case["ending"], "revision": revision,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+
     def commit_action(
         self,
         game_id: str,
@@ -242,8 +484,9 @@ class Database:
         command: dict | None = None,
         declaration: dict | None = None,
         audit: dict | None = None,
+        structured_changes: dict | None = None,
     ) -> dict:
-        """事务内复核幂等、状态版本和随机序号，再提交行动及案件事实。"""
+        """事务内复核并提交行动、结构化记录与案件投影。"""
         action_id = uuid.uuid4().hex
         with self.transaction() as conn:
             if request_hash is not None:
@@ -297,7 +540,7 @@ class Database:
                     "UPDATE games SET roll_count=? WHERE id=?",
                     (game["roll_count"] + 1, game_id),
                 )
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, ?, ?, ?)",
                 (
                     game_id,
@@ -309,6 +552,15 @@ class Database:
                     ),
                 ),
             )
+            if structured_changes is not None:
+                self._apply_structured_changes(
+                    conn,
+                    game_id,
+                    cursor.lastrowid,
+                    current_case,
+                    case_state,
+                    structured_changes,
+                )
             if case_state:
                 next_revision = current_revision + 1
                 conn.execute(
@@ -360,6 +612,106 @@ class Database:
                 )
         return self.get_action(game_id, action_id)
 
+    @staticmethod
+    def _apply_structured_changes(
+        conn: sqlite3.Connection,
+        game_id: str,
+        source_event_id: int,
+        current_case: sqlite3.Row | None,
+        case_state: dict | None,
+        changes: dict,
+    ) -> None:
+        """校验行动声明与实际投影一致，再写入可追溯结构化记录。"""
+        facts = changes.get("facts_add", [])
+        clock = changes.get("clock")
+        knowledge = changes.get("knowledge", [])
+        if (facts or clock) and case_state is None:
+            raise ValueError("事实或 Clock 变化缺少案件投影")
+
+        old_clues = set(json.loads(current_case["clues_json"])) if current_case else set()
+        old_clock = current_case["clock"] if current_case else 0
+        if case_state is not None:
+            new_clues = set(case_state["clues"])
+            if set(fact["fact_id"] for fact in facts) != new_clues - old_clues:
+                raise ValueError("新增事实超出本次行动声明")
+            if old_clues - new_clues:
+                raise ValueError("事实失效必须使用独立失效事件")
+            actual_delta = case_state["clock"] - old_clock
+            if clock is None and actual_delta:
+                raise ValueError("Clock 变化缺少结构化声明")
+            if clock is not None and (
+                clock["before_value"] != old_clock
+                or clock["after_value"] != case_state["clock"]
+                or clock["delta"] != actual_delta
+            ):
+                raise ValueError("Clock 前后值、增量与案件投影不一致")
+
+        for fact in facts:
+            conn.execute(
+                """
+                INSERT INTO case_facts(
+                    game_id, fact_id, subject_id, fact_kind, source_event_id,
+                    visibility, status, mechanical_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+                """,
+                (
+                    game_id,
+                    fact["fact_id"],
+                    fact.get("subject_id", "C01"),
+                    fact.get("fact_kind", "clue"),
+                    source_event_id,
+                    fact.get("visibility", "player"),
+                    json.dumps(fact.get("mechanical", {}), ensure_ascii=False),
+                ),
+            )
+
+        if clock is not None:
+            if (
+                "source_event_id" in clock
+                and clock["source_event_id"] != source_event_id
+            ):
+                raise ValueError("Clock 必须关联本次来源事件")
+            if clock["before_value"] + clock["delta"] != clock["after_value"]:
+                raise ValueError("Clock 前后值与增量不一致")
+            conn.execute(
+                """
+                INSERT INTO clock_changes(
+                    game_id, clock_id, source_event_id, reason,
+                    delta, before_value, after_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    game_id,
+                    clock["clock_id"],
+                    source_event_id,
+                    clock["reason"],
+                    clock["delta"],
+                    clock["before_value"],
+                    clock["after_value"],
+                ),
+            )
+
+        for record in knowledge:
+            conn.execute(
+                """
+                INSERT INTO knowledge_records(
+                    id, game_id, holder_id, kind, source_event_id,
+                    fact_id, content, accuracy, visibility
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.get("id") or uuid.uuid4().hex,
+                    game_id,
+                    record["holder_id"],
+                    record["kind"],
+                    source_event_id,
+                    record.get("fact_id"),
+                    record["content"],
+                    record["accuracy"],
+                    record["visibility"],
+                ),
+            )
+
     def get_action(self, game_id: str, action_id: str) -> dict:
         """读取行动并反序列化已保存的协议、判定、审计和响应。"""
         with self.connect() as conn:
@@ -378,6 +730,63 @@ class Database:
                 (game_id, request_id),
             ).fetchone()
         return self._decode_action(row) if row else None
+
+    def get_hypotheses(self, game_id: str) -> list[dict]:
+        """按创建顺序读取玩家私人假设。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM player_hypotheses WHERE game_id=? ORDER BY created_at, rowid",
+                (game_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_hypothesis(self, game_id: str, hypothesis_id: str) -> dict:
+        """读取限定于当前存档的假设，防止跨存档修改。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM player_hypotheses WHERE game_id=? AND id=?",
+                (game_id, hypothesis_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError("假设不存在")
+        return dict(row)
+
+    def create_hypothesis(self, game_id: str, text: str) -> dict:
+        """在独立事务中新增文本假设，不触碰案件状态。"""
+        self.get_game(game_id)
+        hypothesis_id = uuid.uuid4().hex
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO player_hypotheses(id, game_id, text) VALUES (?, ?, ?)",
+                (hypothesis_id, game_id, text),
+            )
+        return self.get_hypothesis(game_id, hypothesis_id)
+
+    def update_hypothesis(self, game_id: str, hypothesis_id: str, text: str) -> dict:
+        """在独立事务中修改当前存档拥有的假设。"""
+        self.get_game(game_id)
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE player_hypotheses SET text=?, updated_at=CURRENT_TIMESTAMP
+                WHERE game_id=? AND id=?
+                """,
+                (text, game_id, hypothesis_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError("假设不存在")
+        return self.get_hypothesis(game_id, hypothesis_id)
+
+    def delete_hypothesis(self, game_id: str, hypothesis_id: str) -> None:
+        """在独立事务中删除玩家假设，不产生世界事件。"""
+        self.get_game(game_id)
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM player_hypotheses WHERE game_id=? AND id=?",
+                (game_id, hypothesis_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError("假设不存在")
 
     def get_audit(self, game_id: str, limit: int = 50) -> list[dict]:
         """返回有界只读审计及其关联事件，不生成第二份事实权威。"""

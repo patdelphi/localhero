@@ -8,6 +8,7 @@ const state = {
   pendingRequest: null,
   pendingNarrativeId: null,
   auditOpen: false,
+  editingHypothesisId: null,
 };
 
 const elements = {
@@ -28,6 +29,13 @@ const elements = {
   auditPanel: document.querySelector("#audit-panel"),
   auditList: document.querySelector("#audit-list"),
   toggleAudit: document.querySelector("#toggle-audit"),
+  knowledgeList: document.querySelector("#knowledge-list"),
+  hypothesisList: document.querySelector("#hypothesis-list"),
+  hypothesisForm: document.querySelector("#hypothesis-form"),
+  hypothesisInput: document.querySelector("#hypothesis-input"),
+  hypothesisError: document.querySelector("#hypothesis-error"),
+  submitHypothesis: document.querySelector("#submit-hypothesis"),
+  cancelHypothesis: document.querySelector("#cancel-hypothesis"),
 };
 
 const phaseLabels = {
@@ -35,6 +43,27 @@ const phaseLabels = {
   deferred: "委托暂缓",
   active: "调查中",
   closed: "已结案",
+};
+
+const knowledgeKindLabels = {
+  observation: "观察",
+  memory: "记忆",
+  testimony: "证词",
+};
+
+const holderLabels = {
+  player: "你",
+  fang_sheng: "方笙",
+  shao_qian: "邵谦",
+  lin_yanzhou: "林砚舟",
+  a_luo: "阿洛",
+};
+
+const accuracyLabels = {
+  direct: "直接感知",
+  honest: "诚实陈述",
+  misleading: "可能误导",
+  unknown: "准确性未知",
 };
 
 const declarationLabels = {
@@ -171,6 +200,113 @@ function renderCase(caseState) {
   });
 }
 
+function renderKnowledge(items) {
+  elements.knowledgeList.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("li");
+    empty.className = "board-empty";
+    empty.textContent = "暂无观察或证词";
+    elements.knowledgeList.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const entry = document.createElement("li");
+    const content = document.createElement("p");
+    const meta = document.createElement("small");
+    content.textContent = item.content;
+    meta.textContent = `${knowledgeKindLabels[item.kind] || item.kind} · ${holderLabels[item.holder_id] || item.holder_id} · ${accuracyLabels[item.accuracy] || item.accuracy} · 来源事件 #${item.source_event_id}`;
+    entry.append(content, meta);
+    elements.knowledgeList.appendChild(entry);
+  });
+}
+
+function resetHypothesisForm() {
+  state.editingHypothesisId = null;
+  elements.hypothesisInput.value = "";
+  elements.submitHypothesis.textContent = "新增假设";
+  elements.cancelHypothesis.hidden = true;
+}
+
+function renderHypotheses(items) {
+  elements.hypothesisList.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("li");
+    empty.className = "board-empty";
+    empty.textContent = "暂无个人假设";
+    elements.hypothesisList.appendChild(empty);
+    return;
+  }
+  items.forEach((hypothesis) => {
+    const entry = document.createElement("li");
+    const content = document.createElement("p");
+    const controls = document.createElement("div");
+    const edit = document.createElement("button");
+    const remove = document.createElement("button");
+    content.textContent = hypothesis.text;
+    controls.className = "hypothesis-item-controls";
+    edit.type = "button";
+    edit.className = "text-button";
+    edit.textContent = "编辑";
+    edit.addEventListener("click", () => {
+      state.editingHypothesisId = hypothesis.id;
+      elements.hypothesisInput.value = hypothesis.text;
+      elements.submitHypothesis.textContent = "保存修改";
+      elements.cancelHypothesis.hidden = false;
+      elements.hypothesisInput.focus();
+    });
+    remove.type = "button";
+    remove.className = "text-button danger-button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => removeHypothesis(hypothesis.id));
+    controls.append(edit, remove);
+    entry.append(content, controls);
+    elements.hypothesisList.appendChild(entry);
+  });
+}
+
+async function loadCaseBoard() {
+  const [knowledge, hypotheses] = await Promise.all([
+    api(`/api/games/${state.gameId}/knowledge`),
+    api(`/api/games/${state.gameId}/hypotheses`),
+  ]);
+  renderKnowledge(knowledge.items);
+  renderHypotheses(hypotheses.items);
+}
+
+async function saveHypothesis(event) {
+  event.preventDefault();
+  const text = elements.hypothesisInput.value.trim();
+  if (!text) return;
+  elements.hypothesisError.textContent = "";
+  elements.submitHypothesis.disabled = true;
+  try {
+    const path = state.editingHypothesisId
+      ? `/api/games/${state.gameId}/hypotheses/${state.editingHypothesisId}`
+      : `/api/games/${state.gameId}/hypotheses`;
+    await api(path, {
+      method: state.editingHypothesisId ? "PATCH" : "POST",
+      body: JSON.stringify({ text }),
+    });
+    resetHypothesisForm();
+    await loadCaseBoard();
+  } catch (error) {
+    elements.hypothesisError.textContent = error.message;
+  } finally {
+    elements.submitHypothesis.disabled = false;
+  }
+}
+
+async function removeHypothesis(hypothesisId) {
+  elements.hypothesisError.textContent = "";
+  try {
+    await api(`/api/games/${state.gameId}/hypotheses/${hypothesisId}`, { method: "DELETE" });
+    if (state.editingHypothesisId === hypothesisId) resetHypothesisForm();
+    await loadCaseBoard();
+  } catch (error) {
+    elements.hypothesisError.textContent = error.message;
+  }
+}
+
 async function loadGame(gameId) {
   const data = await api(`/api/games/${gameId}`);
   showGame(gameId);
@@ -180,6 +316,7 @@ async function loadGame(gameId) {
   renderCase(data.case);
   elements.sceneLog.replaceChildren(...data.events.map(renderEvent));
   elements.sceneLog.lastElementChild?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  await loadCaseBoard();
   if (state.auditOpen) await loadAudit();
 }
 
@@ -392,6 +529,8 @@ async function loadAudit() {
 document.querySelector("#new-game-form").addEventListener("submit", createGame);
 document.querySelector("#load-game-form").addEventListener("submit", loadExistingGame);
 document.querySelector("#action-form").addEventListener("submit", previewAction);
+elements.hypothesisForm.addEventListener("submit", saveHypothesis);
+elements.cancelHypothesis.addEventListener("click", resetHypothesisForm);
 elements.confirm.addEventListener("click", confirmAction);
 elements.cancel.addEventListener("click", () => {
   state.pendingRequest = null;

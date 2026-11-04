@@ -88,8 +88,26 @@
             </ul>
           </section>
           <section class="context-block">
-            <p class="section-index">已知线索</p>
+            <p class="section-index">证据</p>
             <ul id="clue-list" class="clue-list"></ul>
+          </section>
+          <section class="context-block">
+            <p class="section-index">观察与证词</p>
+            <ul id="knowledge-list" class="knowledge-list"></ul>
+          </section>
+          <section class="context-block">
+            <p class="section-index">我的假设</p>
+            <p class="board-note">仅供个人推理，不改变案件状态。</p>
+            <form id="hypothesis-form" class="hypothesis-form">
+              <label class="sr-only" for="hypothesis-input">假设内容</label>
+              <textarea id="hypothesis-input" rows="2" maxlength="4000" placeholder="记录一个可修改的假设" required></textarea>
+              <div class="hypothesis-controls">
+                <button id="cancel-hypothesis" class="text-button" type="button" hidden>取消编辑</button>
+                <button id="submit-hypothesis" type="submit">新增假设</button>
+              </div>
+            </form>
+            <ul id="hypothesis-list" class="hypothesis-list"></ul>
+            <p id="hypothesis-error" class="error" role="alert"></p>
           </section>
           <section class="context-block">
             <p class="section-index">案件结局</p>

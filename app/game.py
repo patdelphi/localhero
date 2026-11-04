@@ -3,7 +3,12 @@
 import json
 import threading
 
-from app.action_pipeline import apply_plan, make_audit, prepare_action
+from app.action_pipeline import (
+    apply_plan,
+    build_structured_changes,
+    make_audit,
+    prepare_action,
+)
 from app.action_protocol import (
     IdempotencyConflict,
     PermissionDenied,
@@ -14,7 +19,7 @@ from app.action_protocol import (
     normalize_text,
 )
 from app.case_content import CONTENT_VERSION
-from app.case_engine import public_state
+from app.case_engine import action_by_id, public_state
 from app.model import SimulationError
 from app.rules import roll_for_sequence
 from app.store import Database
@@ -64,6 +69,7 @@ class GameService:
                 "selected_action": plan["selected_action"],
                 "candidates": plan["candidates"],
                 "declaration": plan["declaration"],
+                "mechanical_changes": plan["mechanical_changes"],
                 "pipeline": plan["pipeline"],
                 "permission": plan["permission"],
                 "random": None,
@@ -117,7 +123,16 @@ class GameService:
                     game["seed"], game["roll_count"], plan["intent"]["modifier"]
                 ).to_dict()
             next_case_state = apply_plan(plan, case_state, roll)
-            audit = make_audit(plan, game, case_state, roll, next_case_state)
+            structured_changes = None
+            if plan["case_action"]:
+                action_content = action_by_id(plan["intent"]["action_id"])
+                outcome = roll["outcome"] if roll else "no_roll"
+                structured_changes = build_structured_changes(
+                    action_content, case_state, outcome
+                )
+            audit = make_audit(
+                plan, game, case_state, roll, next_case_state, structured_changes
+            )
             submitted_revision = (
                 case_state["revision"] if expected_revision is None else expected_revision
             )
@@ -134,6 +149,7 @@ class GameService:
                 command=command,
                 declaration=plan["declaration"],
                 audit=audit,
+                structured_changes=structured_changes,
             )
             return self._narrate_or_pending(action)
 
@@ -141,6 +157,34 @@ class GameService:
         """读取有界审计列表，不暴露额外写入口。"""
         self.db.get_game(game_id)
         return {"items": self.db.get_audit(game_id, limit)}
+
+    def get_knowledge(self, game_id: str) -> dict:
+        """返回玩家可见认知，不提供任意人物私密知识查询参数。"""
+        self.db.get_game(game_id)
+        return {"items": self.db.get_player_knowledge(game_id)}
+
+    def get_hypotheses(self, game_id: str) -> dict:
+        """读取当前存档的玩家假设。"""
+        self.db.get_game(game_id)
+        return {"items": self.db.get_hypotheses(game_id)}
+
+    def create_hypothesis(self, game_id: str, text: str) -> dict:
+        """保存非空文本假设，不调用模型或推进游戏。"""
+        normalized = normalize_text(text)
+        if not normalized:
+            raise ValueError("假设内容不能为空")
+        return self.db.create_hypothesis(game_id, normalized)
+
+    def update_hypothesis(self, game_id: str, hypothesis_id: str, text: str) -> dict:
+        """修改当前存档的非空文本假设。"""
+        normalized = normalize_text(text)
+        if not normalized:
+            raise ValueError("假设内容不能为空")
+        return self.db.update_hypothesis(game_id, hypothesis_id, normalized)
+
+    def delete_hypothesis(self, game_id: str, hypothesis_id: str) -> None:
+        """删除当前存档的玩家假设。"""
+        self.db.delete_hypothesis(game_id, hypothesis_id)
 
     def retry_narrative(self, game_id: str, action_id: str) -> dict:
         """只重试叙事，不重新解析、掷骰或推进行动事实。"""

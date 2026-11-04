@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sqlite3
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -35,10 +35,16 @@ class ActionRequest(PreviewRequest):
     expected_revision: int | None = Field(default=None, ge=0)
 
 
+class HypothesisRequest(BaseModel):
+    """玩家假设只包含可编辑文本，不接受机械状态字段。"""
+
+    text: str = Field(max_length=4000)
+
+
 def create_app(db_path: str | Path, model: SimulatedModel | None = None) -> FastAPI:
     """创建可注入临时数据库和模拟模型的应用，便于隔离测试。"""
     service = GameService(Database(db_path).initialize(), model or SimulatedModel())
-    app = FastAPI(title="灰区事务所", version="0.2.0")
+    app = FastAPI(title="灰区事务所", version="0.3.0")
     app.state.service = service
 
     @app.exception_handler(KeyError)
@@ -77,6 +83,27 @@ def create_app(db_path: str | Path, model: SimulatedModel | None = None) -> Fast
     @app.get("/api/games/{game_id}")
     def get_game(game_id: str):
         return service.get_game(game_id)
+
+    @app.get("/api/games/{game_id}/knowledge")
+    def get_knowledge(game_id: str):
+        return service.get_knowledge(game_id)
+
+    @app.get("/api/games/{game_id}/hypotheses")
+    def get_hypotheses(game_id: str):
+        return service.get_hypotheses(game_id)
+
+    @app.post("/api/games/{game_id}/hypotheses", status_code=201)
+    def create_hypothesis(game_id: str, request: HypothesisRequest):
+        return service.create_hypothesis(game_id, request.text)
+
+    @app.patch("/api/games/{game_id}/hypotheses/{hypothesis_id}")
+    def update_hypothesis(game_id: str, hypothesis_id: str, request: HypothesisRequest):
+        return service.update_hypothesis(game_id, hypothesis_id, request.text)
+
+    @app.delete("/api/games/{game_id}/hypotheses/{hypothesis_id}", status_code=204)
+    def delete_hypothesis(game_id: str, hypothesis_id: str):
+        service.delete_hypothesis(game_id, hypothesis_id)
+        return Response(status_code=204)
 
     @app.post("/api/games/{game_id}/actions/preview")
     def preview_action(game_id: str, request: PreviewRequest):

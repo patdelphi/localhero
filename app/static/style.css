@@ -121,6 +121,17 @@ button:hover:not(:disabled) { filter: brightness(1.1); }
 .clue-list li { padding: 10px 0; border-bottom: 1px dotted var(--line); color: #d5d3c8; font-size: 13px; line-height: 1.6; }
 .clue-list li::before { content: "▸ "; color: var(--accent); }
 .empty-clue { color: var(--muted); }
+.board-note { margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.knowledge-list, .hypothesis-list { list-style: none; margin: 0; padding: 0; }
+.knowledge-list li, .hypothesis-list li { padding: 12px 0; border-bottom: 1px dotted var(--line); }
+.knowledge-list p, .hypothesis-list p { margin: 0 0 6px; color: #d5d3c8; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+.knowledge-list small { color: var(--muted); font-size: 10px; line-height: 1.6; }
+.board-empty { color: var(--muted); font-size: 12px; }
+.hypothesis-form textarea { min-height: 68px; padding: 10px; font-size: 12px; }
+.hypothesis-controls, .hypothesis-item-controls { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 8px; }
+.hypothesis-controls button[type="submit"] { padding: 7px 10px; font-size: 12px; }
+.hypothesis-item-controls { justify-content: flex-start; margin-top: 0; }
+.danger-button { color: var(--danger); }
 .ending-text { margin: 12px 0 0; color: var(--teal); font: 600 15px/1.7 var(--serif); }
 
 .action-dock { margin-top: 32px; padding: 24px; background: var(--panel-raised); border: 1px solid var(--line); }

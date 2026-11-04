@@ -142,7 +142,7 @@ def test_case_authorizer_rejects_global_canon_write():
 
 
 def test_legacy_database_migrates_with_explicit_audit_gap(tmp_path):
-    """旧存档升级到版本 2，历史行动只标记 legacy，不伪造轨迹。"""
+    """旧存档升级到当前版本，历史行动只标记 legacy，不伪造轨迹。"""
     path = tmp_path / "legacy.db"
     with sqlite3.connect(path) as conn:
         conn.executescript(
@@ -187,8 +187,9 @@ def test_legacy_database_migrates_with_explicit_audit_gap(tmp_path):
         }
         assert "request_hash" not in old_columns
         assert backup.execute("SELECT COUNT(*) FROM actions").fetchone()[0] == 1
+    assert (tmp_path / "legacy.db.pre-v3.bak").exists()
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(actions)").fetchall()
         }

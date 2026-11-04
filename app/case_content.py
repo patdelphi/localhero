@@ -1,6 +1,6 @@
 """程序说明：定义 C01《不存在的人》小型单案的固定地点、行动、线索和结局。"""
 
-CONTENT_VERSION = "c01-1.0"
+CONTENT_VERSION = "c01-1.1"
 
 # 行动前声明只补充展示元数据，机械后果仍由下方固定 effects 唯一决定。
 ACTION_METADATA = {
@@ -34,6 +34,109 @@ CLUE_LABELS = {
     "freight_manifest": "货运签显示苗雨前往沉没带",
     "manifest_alternative": "货运记录残缺，但能确认离开方向",
     "miaoyu_alive": "苗雨仍在世，暂住白鹭滞留区",
+}
+
+# 核心线索声明只描述已创作路径；实际权限和结果仍由 ACTIONS 与程序判定决定。
+CLUE_DEFINITIONS = {
+    "commission": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "accept_commission", "outcomes": ["no_roll"]}],
+        "alternatives": [],
+    },
+    "fangsheng_present": {
+        "priority": "advantage",
+        "acquisition": [{"action_id": "inspect_fangsheng_room", "outcomes": ["success", "partial", "escalation"]}],
+        "alternatives": [],
+    },
+    "project_export": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "request_project_export", "outcomes": ["success", "partial"]}],
+        "alternatives": [{"via": "retry_export", "action_id": "request_project_export"}],
+    },
+    "export_delayed": {
+        "priority": "advantage",
+        "acquisition": [{"action_id": "request_project_export", "outcomes": ["escalation"]}],
+        "alternatives": [{"via": "retry_export", "action_id": "request_project_export"}],
+    },
+    "shared_account": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "check_shared_account", "outcomes": ["success", "partial", "escalation"]}],
+        "alternatives": [
+            {"via": "project_export", "action_id": "check_shared_account"},
+            {"via": "export_delayed", "action_id": "check_shared_account"},
+        ],
+    },
+    "risk_warning": {
+        "priority": "advantage",
+        "acquisition": [{"action_id": "check_shared_account", "outcomes": ["escalation"]}],
+        "alternatives": [],
+    },
+    "shaqian_admission": {
+        "priority": "advantage",
+        "acquisition": [{"action_id": "confront_shaoqian", "outcomes": ["success", "partial"]}],
+        "alternatives": [{"via": "shared_account", "action_id": "end_collective_review"}],
+    },
+    "anonymous_patient": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "ask_anonymous_patient", "outcomes": ["success", "partial", "escalation"]}],
+        "alternatives": [],
+    },
+    "clinic_hint": {
+        "priority": "advantage",
+        "acquisition": [{"action_id": "ask_anonymous_patient", "outcomes": ["escalation"]}],
+        "alternatives": [],
+    },
+    "freight_manifest": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "check_freight_record", "outcomes": ["success", "partial"]}],
+        "alternatives": [{"via": "manifest_alternative", "action_id": "contact_miaoyu"}],
+    },
+    "manifest_alternative": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "check_freight_record", "outcomes": ["escalation"]}],
+        "alternatives": [{"via": "retry_freight_record", "action_id": "check_freight_record"}],
+    },
+    "miaoyu_alive": {
+        "priority": "necessary",
+        "acquisition": [{"action_id": "contact_miaoyu", "outcomes": ["success", "partial", "escalation"]}],
+        "alternatives": [
+            {"via": "freight_manifest", "action_id": "contact_miaoyu"},
+            {"via": "manifest_alternative", "action_id": "contact_miaoyu"},
+        ],
+    },
+}
+
+# 固定感知与信息传递声明；不存在根据主持人秘密自动补全人物知识的入口。
+KNOWLEDGE_DECLARATIONS = {
+    "commission_details": [{
+        "holder_id": "fang_sheng", "kind": "testimony", "fact_id": None,
+        "content": "方笙说明苗雨身份验证异常及最后收到的自动短讯。",
+        "accuracy": "honest", "visibility": "player", "outcomes": ["no_roll"],
+    }],
+    "confront_shaoqian": [
+        {
+            "holder_id": "shao_qian", "kind": "testimony", "fact_id": "shaqian_admission",
+            "content": "邵谦承认旧凭证仍在使用。",
+            "accuracy": "honest", "visibility": "player", "outcomes": ["success", "partial"],
+        },
+        {
+            "holder_id": "shao_qian", "kind": "testimony", "fact_id": None,
+            "content": "邵谦拒绝承认旧凭证仍在使用，只让调查者去找公司。",
+            "accuracy": "misleading", "visibility": "player", "outcomes": ["escalation"],
+        },
+    ],
+    "ask_anonymous_patient": [{
+        "holder_id": "lin_yanzhou", "kind": "testimony", "fact_id": "anonymous_patient",
+        "content": "林砚舟确认匿名女性的就诊体征与苗雨相符。",
+        "accuracy": "honest", "visibility": "player",
+        "outcomes": ["success", "partial", "escalation"],
+    }],
+    "contact_miaoyu": [{
+        "holder_id": "a_luo", "kind": "testimony", "fact_id": "miaoyu_alive",
+        "content": "阿洛确认苗雨安全，暂住白鹭滞留区。",
+        "accuracy": "honest", "visibility": "player",
+        "outcomes": ["success", "partial", "escalation"],
+    }],
 }
 
 ENDINGS = {
