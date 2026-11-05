@@ -1,5 +1,7 @@
 ﻿# 第二批规则研究交付任务
 
+> **归档说明（2026-11-05）**：本文件是第二批公开资料研究的历史任务清单，已全部完成，不再作为后续执行依据。项目当前状态见 [current-status.md](../current-status.md)。
+
 - [x] 1. 写 `Docs/research/04-pbta-forged-in-the-dark.md`，核对 Apocalypse World PDF 页码与 Blades 官方章节链接。
 - [x] 2. 写 `Docs/research/05-gumshoe-ironsworn.md`，核对两份 PDF 的版本、许可证和物理页码。
 - [x] 3. 写 `Docs/research/06-mythic-fate.md`，保留 Mythic 公开证据缺口，核对 Fate 官方 SRD 与 CC BY 3.0。
