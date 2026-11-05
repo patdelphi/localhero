@@ -117,7 +117,7 @@ def test_committed_action_has_complete_trace_and_event_links(tmp_path):
     entry = entries[0]
     audit = entry["audit"]
     assert entry["action_id"] == result["action_id"]
-    assert audit["audit_version"] == 1
+    assert audit["audit_version"] == 3
     assert audit["rules_version"]
     assert audit["content_version"]
     assert audit["candidates"]
@@ -188,8 +188,9 @@ def test_legacy_database_migrates_with_explicit_audit_gap(tmp_path):
         assert "request_hash" not in old_columns
         assert backup.execute("SELECT COUNT(*) FROM actions").fetchone()[0] == 1
     assert (tmp_path / "legacy.db.pre-v3.bak").exists()
+    assert (tmp_path / "legacy.db.pre-v5.bak").exists()
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(actions)").fetchall()
         }

@@ -21,6 +21,7 @@ from app.action_protocol import (
 from app.case_content import CONTENT_VERSION
 from app.case_engine import action_by_id, public_state
 from app.model import SimulationError
+from app.replay_engine import ReplayEngine
 from app.rules import roll_for_sequence
 from app.store import Database
 
@@ -62,8 +63,10 @@ class GameService:
             case_state = self.db.get_case_state(game_id)
             social_states = self.db.get_social_states(game_id)
             local_plans = self.db.get_local_plans(game_id)
+            decision_context = self.db.get_decision_context(game_id)
             plan = prepare_action(
-                action_text, case_state, self.model, action_id, social_states, local_plans
+                action_text, case_state, self.model, action_id, social_states, local_plans,
+                decision_context,
             )
             return {
                 "revision": case_state["revision"],
@@ -119,8 +122,10 @@ class GameService:
                 raise StateConflict("案件状态已变化，请重新预览")
             social_states = self.db.get_social_states(game_id)
             local_plans = self.db.get_local_plans(game_id)
+            decision_context = self.db.get_decision_context(game_id)
             plan = prepare_action(
-                action_text, case_state, self.model, action_id, social_states, local_plans
+                action_text, case_state, self.model, action_id, social_states, local_plans,
+                decision_context,
             )
             if not plan["can_submit"]:
                 raise PermissionDenied(plan["reason"] or "行动未通过程序审核")
@@ -136,10 +141,15 @@ class GameService:
                 action_content = action_by_id(plan["intent"]["action_id"])
                 outcome = roll["outcome"] if roll else "no_roll"
                 structured_changes = build_structured_changes(
-                    action_content, case_state, outcome, social_states, local_plans
+                    action_content, case_state, outcome, social_states, local_plans,
+                    decision_context,
                 )
+            from app.npc_decision import decision_context_hash
+
+            context_hash = decision_context_hash(decision_context)
             audit = make_audit(
-                plan, game, case_state, roll, next_case_state, structured_changes
+                plan, game, case_state, roll, next_case_state, structured_changes,
+                context_hash,
             )
             submitted_revision = (
                 case_state["revision"] if expected_revision is None else expected_revision
@@ -158,6 +168,7 @@ class GameService:
                 declaration=plan["declaration"],
                 audit=audit,
                 structured_changes=structured_changes,
+                expected_decision_context_hash=context_hash,
             )
             return self._narrate_or_pending(action)
 
@@ -165,6 +176,14 @@ class GameService:
         """读取有界审计列表，不暴露额外写入口。"""
         self.db.get_game(game_id)
         return {"items": self.db.get_audit(game_id, limit)}
+
+    def get_timeline(self, game_id: str) -> dict:
+        """读取玩家可见历史，不返回完整基线或私密机械记录。"""
+        return ReplayEngine(self.db).timeline(game_id)
+
+    def verify_replay(self, game_id: str, through_action_id: str | None = None) -> dict:
+        """在独立内存库重算指定历史前缀，不调用模型或修改原档。"""
+        return ReplayEngine(self.db).verify(game_id, through_action_id)
 
     def get_knowledge(self, game_id: str) -> dict:
         """返回玩家可见认知，不提供任意人物私密知识查询参数。"""

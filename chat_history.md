@@ -604,3 +604,23 @@ push
 ### 未执行事项
 
 未执行 Git commit／push／merge／pull，未接入 AI Provider，未修改真实存档。
+
+## 2026-11-05T13:50:57+08:00 — 提交代码变更与更新忽略规则
+
+### 用户请求
+
+trae 不要提交，自己判断哪些应该提交、哪些不提交，并更新 `.gitignore`。
+
+### 变更内容
+
+`.gitignore` 新增 `data/*.bak` 与 `.trae/`；真实存档、WAL 文件、迁移备份和 Trae 工作区不再进入版本库。
+
+提交第四至第六阶段代码与测试：确定性回放、NPC 自主决策与场景导演、认知来源与记忆衰减，以及对应三个专项测试和设计文档。
+
+### 验证结果
+
+全量 pytest **109 passed**；`git status --ignored` 确认 `.trae/` 与 `data/` 已被忽略。
+
+### 未执行事项
+
+未执行 Git push，未接入 AI Provider，未修改真实存档内容。

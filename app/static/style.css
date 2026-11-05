@@ -163,6 +163,15 @@ h3, h4 { font-family: var(--serif); }
 .audit-list details section { margin: 16px 0 0 16px; }
 .audit-list h4 { margin: 0 0 8px; color: var(--teal); font-size: 13px; }
 .audit-list ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.replay-controls { margin: 16px 0; }
+.replay-controls button { padding: 8px 12px; font-size: 12px; }
+.replay-result { margin: 12px 0; color: var(--teal); font-size: 13px; line-height: 1.8; white-space: pre-wrap; }
+.replay-result.mismatch { color: var(--danger); }
+.timeline-item { padding: 16px 0; border-top: 1px solid var(--line); }
+.timeline-item h3 { margin: 0 0 8px; color: var(--accent); font-size: 15px; }
+.timeline-item p { margin: 7px 0; color: #d5d3c8; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+.timeline-item small { display: block; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.timeline-item button { margin-top: 8px; padding: 5px 0; }
 
 @media (max-width: 850px) {
   .entry-grid, .play-layout { grid-template-columns: 1fr; }

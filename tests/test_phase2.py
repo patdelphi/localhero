@@ -306,7 +306,8 @@ def test_invalid_knowledge_kind_rolls_back_action(tmp_path):
         }],
     }
 
-    with pytest.raises(sqlite3.IntegrityError):
+    # v6 在数据库约束前由服务层拒绝非法枚举，仍须验证整个行动回滚。
+    with pytest.raises(ValueError, match="认知记录类型非法"):
         db.commit_action(
             game["id"],
             "invalid-knowledge",

@@ -1,4 +1,6 @@
-"""程序说明：实现候选过滤、Before/Instead/Check、权限审核和有界 After 规划。"""
+"""程序说明：实现行动管线、NPC回应、自主决策、场景导演和版本2审计。"""
+
+from copy import deepcopy
 
 from app.action_protocol import PermissionDenied, RULES_VERSION
 from app.case_content import (
@@ -9,8 +11,16 @@ from app.case_content import (
     KNOWLEDGE_DECLARATIONS,
 )
 from app.case_engine import action_by_id, resolve_action
+from app.cognition_engine import (
+    assign_cognition_ids,
+    build_cognition_view,
+    build_declared_cognition,
+    validate_cognition_changes,
+)
 from app.local_simulation import advance_local_simulation
-from app.social_engine import build_social_changes
+from app.npc_decision import decide_npc_plan, make_decision_context
+from app.scene_director import select_scene
+from app.social_engine import build_social_changes, judge_social_response
 
 
 class CaseAuthorizer:
@@ -74,6 +84,7 @@ def prepare_action(
     action_id: str | None = None,
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
+    decision_context: dict | None = None,
 ) -> dict:
     """生成不写库、不掷骰的行动计划，显式选择也必须通过 Check。"""
     candidates = candidate_actions(state)
@@ -106,6 +117,60 @@ def prepare_action(
             action = None
             selected = None
 
+    return _complete_plan(
+        state, intent, action_id, action, selected, candidates,
+        selection_source, selection_reason, social_states, local_plans,
+        decision_context,
+    )
+
+
+def prepare_recorded_action(
+    command: dict,
+    intent: dict,
+    state: dict,
+    social_states: list[dict] | None = None,
+    local_plans: list[dict] | None = None,
+    decision_context: dict | None = None,
+) -> dict:
+    """仅按已保存命令和意图重建计划，不解析文本、不调用模型。"""
+    candidates = candidate_actions(state)
+    by_id = {candidate["action_id"]: candidate for candidate in candidates}
+    action_id = command.get("action_id")
+    if intent.get("kind") == "case_action":
+        recorded_id = intent.get("action_id")
+        if action_id is not None and action_id != recorded_id:
+            raise PermissionDenied("已保存命令与案件意图不一致")
+        action_id = recorded_id
+        if action_id not in by_id:
+            raise PermissionDenied("已记录行动不是固定案件行动")
+        action = action_by_id(action_id)
+        selected = by_id[action_id]
+    else:
+        if action_id is not None:
+            raise PermissionDenied("场景行动不能携带案件行动编号")
+        action = None
+        selected = None
+    return _complete_plan(
+        state, intent, action_id, action, selected, candidates,
+        "recorded_replay", "按已保存规范命令与意图重算",
+        social_states, local_plans, decision_context,
+    )
+
+
+def _complete_plan(
+    state: dict,
+    intent: dict,
+    action_id: str | None,
+    action: dict | None,
+    selected: dict | None,
+    candidates: list[dict],
+    selection_source: str,
+    selection_reason: str,
+    social_states: list[dict] | None,
+    local_plans: list[dict] | None,
+    decision_context: dict | None = None,
+) -> dict:
+    """共用候选、Check、声明和机械计划，确保实时行动与回放同规则。"""
     eligible = selected["eligible"] if selected else True
     reason = None if eligible else "；".join(selected["excluded_reasons"])
     selected_id = action_id or intent["kind"]
@@ -127,6 +192,10 @@ def prepare_action(
             "reason": reason,
         }
 
+    instead_rule = {
+        "host_command": "instead.explicit_action",
+        "recorded_replay": "instead.recorded_replay",
+    }.get(selection_source, "instead.none")
     pipeline = [
         {
             "stage": "Before",
@@ -135,7 +204,7 @@ def prepare_action(
         },
         {
             "stage": "Instead",
-            "rule_id": "instead.explicit_action" if selection_source == "host_command" else "instead.none",
+            "rule_id": instead_rule,
             "result": selection_reason,
         },
         {
@@ -162,7 +231,7 @@ def prepare_action(
         },
         "declaration": make_declaration(intent, action, state),
         "mechanical_changes": preview_structured_changes(
-            action, state, social_states, local_plans
+            action, state, social_states, local_plans, decision_context
         ),
         "pipeline": pipeline,
         "permission": permission,
@@ -220,18 +289,27 @@ def preview_structured_changes(
     state: dict,
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
+    decision_context: dict | None = None,
 ) -> list[dict]:
-    """按判定结果列出预览摘要；此处不分配来源事件或写入数据库。"""
+    """按判定结果列出公开摘要，不暴露评分、知识引用或未激活场景。"""
     if action is None:
         return []
     previews = []
     for outcome in action["effects"]:
         changes = build_structured_changes(
-            action, state, outcome, social_states, local_plans
+            action, state, outcome, social_states, local_plans, decision_context
         )
-        # 玩家预览只展示公开摘要，完整结构变化由实际提交事务内部使用。
+        after_time = changes["world_time"]["after"]
+        has_due_plan = any(
+            item["status"] == "pending" and item["due_time"] <= after_time
+            for item in (local_plans or [])
+        )
         changes["social"] = {"public": changes["social"]["public"]}
-        changes["simulation"] = {"public": changes["simulation"]["public"]}
+        changes["simulation"] = {
+            "public": ["可能处理已到期公开计划。"] if has_due_plan else []
+        }
+        changes.pop("scenes", None)
+        changes.pop("autonomy", None)
         previews.append({"outcome": outcome, **changes})
     return previews
 
@@ -242,8 +320,9 @@ def build_structured_changes(
     outcome: str,
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
+    decision_context: dict | None = None,
 ) -> dict:
-    """从固定内容计算事实、时间、认知、社会变化与局部模拟。"""
+    """从固定内容计算玩家结果，再串行执行回应者、NPC决策和场景导演。"""
     effect = action["effects"].get(outcome, {})
     new_clues = [clue for clue in effect.get("clues_add", []) if clue not in state["clues"]]
     facts = [
@@ -264,14 +343,22 @@ def build_structured_changes(
             "content": CLUE_LABELS[clue],
             "accuracy": "direct",
             "visibility": "player",
+            "source_record_id": None,
+            "observed_at": state.get("world_time", 0) + action.get("time_cost", 0),
+            "precision": "exact",
+            "corrects_record_id": None,
         }
         for clue in new_clues
     ]
     for declaration in KNOWLEDGE_DECLARATIONS.get(action["id"], []):
         if outcome in declaration["outcomes"]:
-            knowledge.append(
-                {key: value for key, value in declaration.items() if key != "outcomes"}
-            )
+            knowledge.append({
+                "source_record_id": None,
+                "observed_at": None,
+                "precision": "unknown",
+                "corrects_record_id": None,
+                **{key: value for key, value in declaration.items() if key != "outcomes"},
+            })
     delta = effect.get("clock_add", 0)
     clock = None
     if delta:
@@ -282,15 +369,59 @@ def build_structured_changes(
             "before_value": state["clock"],
             "after_value": state["clock"] + delta,
         }
+    if decision_context is not None:
+        if social_states is None:
+            social_states = decision_context.get("social_states", [])
+        if local_plans is None:
+            local_plans = decision_context.get("local_plans", [])
     social_states = social_states or []
     local_plans = local_plans or []
     before_time = state.get("world_time", 0)
     time_cost = action.get("time_cost", 0)
     after_time = before_time + time_cost
+    response = judge_social_response(action, outcome, social_states, local_plans)
     social = build_social_changes(
-        action, outcome, after_time, social_states, local_plans
+        action, outcome, after_time, social_states, local_plans, response
     )
-    simulation = advance_local_simulation(after_time, social_states, local_plans)
+    if decision_context is None:
+        decision_context = make_decision_context(
+            state, social_states, local_plans, [], [], [], 0
+        )
+    simulation, scenes, autonomy = _build_autonomy_changes(
+        deepcopy(decision_context), social_states, local_plans, social, after_time,
+        "commission" in state["clues"] or action["id"] == "accept_commission",
+    )
+    if response is not None:
+        autonomy["responses"].append(response)
+    knowledge.extend(build_declared_cognition(
+        action, outcome, decision_context, after_time
+    ))
+    game_id = decision_context.get("game_id", "local")
+    knowledge = assign_cognition_ids(knowledge, game_id, action["id"])
+    simulation["knowledge"] = assign_cognition_ids(
+        simulation["knowledge"], game_id, f"{action['id']}:autonomy"
+    )
+    cognition_records = knowledge + simulation["knowledge"]
+    # 校验以行动后时间为准，同时保持原决策上下文不变。
+    validation_context = deepcopy(decision_context)
+    validation_context["after_time"] = after_time
+    validate_cognition_changes(cognition_records, validation_context, {})
+    decay = []
+    for holder_id in sorted({item["holder_id"] for item in decision_context["knowledge"]}):
+        for record in build_cognition_view(
+            holder_id, decision_context["knowledge"], after_time
+        ):
+            if record["kind"] in {"observation", "memory"}:
+                decay.append({
+                    "holder_id": holder_id,
+                    "knowledge_id": record["knowledge_id"],
+                    "base_precision": record["precision"],
+                    "effective_precision": record["effective_precision"],
+                    "elapsed_time": (
+                        after_time - record["observed_at"]
+                        if record["observed_at"] is not None else None
+                    ),
+                })
     return {
         "facts_add": facts,
         "clock": clock,
@@ -302,7 +433,62 @@ def build_structured_changes(
         },
         "social": social,
         "simulation": simulation,
+        "scenes": scenes,
+        "autonomy": autonomy,
+        "cognition": {
+            "world_time": after_time,
+            "records": cognition_records,
+            "decay": decay,
+        },
     }
+
+
+def _build_autonomy_changes(
+    context, social_states, local_plans, social, after_time, has_commission
+):
+    """每个原到期计划只决策一次；新建立计划不在同一边界链式触发。"""
+    simulation = advance_local_simulation(
+        after_time, social_states, local_plans, process_plans=False
+    )
+    autonomy = {"responses": [], "decisions": [], "scenes": []}
+    scenes = []
+    due_plans = sorted(
+        (
+            item for item in local_plans
+            if item["scope"] == "c01" and item["status"] == "pending"
+            and item["due_time"] <= after_time
+        ),
+        key=lambda item: (item["due_time"], item["plan_id"]),
+    )
+    if len(due_plans) > 8:
+        raise ValueError("单次行动到期计划超过8项上限")
+    context["after_time"] = after_time
+    context["social_states"] = deepcopy(social_states) + deepcopy(social["states"])
+    context["local_plans"] = deepcopy(local_plans)
+    context["channels"] = ["remote_message"] if has_commission else []
+    for plan in due_plans:
+        decision = decide_npc_plan(plan, context)
+        directed = select_scene(decision, context)
+        autonomy["decisions"].append({
+            key: value for key, value in decision.items() if key != "changes"
+        })
+        autonomy["scenes"].extend(directed["scenes"])
+        if directed["scene"] is None:
+            continue
+        scenes.append(directed["scene"])
+        for key in ("plans", "states", "knowledge", "history", "public"):
+            simulation[key].extend(directed["changes"][key])
+        # 更新只读工作副本，保证多个计划的顺序和重复场景判断确定。
+        for update in directed["changes"]["plans"]:
+            current = next(
+                item for item in context["local_plans"]
+                if item["plan_id"] == update["plan_id"]
+            )
+            current["status"] = update["status"]
+        context["knowledge"].extend(deepcopy(directed["changes"]["knowledge"]))
+        context["character_history"].extend(deepcopy(directed["changes"]["history"]))
+        context.setdefault("activated_scenes", []).append(directed["scene"]["scene_id"])
+    return simulation, scenes, autonomy
 
 
 def apply_plan(plan: dict, state: dict, roll: dict | None) -> dict | None:
@@ -324,8 +510,9 @@ def make_audit(
     roll: dict | None,
     next_state: dict | None,
     structured_changes: dict | None = None,
+    decision_context_hash: str | None = None,
 ) -> dict:
-    """把计划、权限和已发生的纯判定组成可持久化审计。"""
+    """组成版本2完整内部审计；公开接口另行裁剪自主决策细节。"""
     after_revision = state["revision"] + (1 if next_state else 0)
     random_audit = None
     if roll:
@@ -334,15 +521,29 @@ def make_audit(
             "sequence": game["roll_count"],
             **roll,
         }
+    stored_changes = deepcopy(structured_changes) if structured_changes else None
+    autonomy = (stored_changes or {}).pop("autonomy", None) or {
+        "responses": [], "decisions": [], "scenes": [],
+    }
+    cognition = (stored_changes or {}).pop("cognition", None) or {
+        "world_time": state.get("world_time", 0), "records": [], "decay": [],
+    }
+    autonomy.update({
+        "decision_context_hash": decision_context_hash,
+        "random_sequence_before": game["roll_count"],
+        "random_sequence_after_player": game["roll_count"] + (1 if roll else 0),
+    })
     return {
-        "audit_version": 1,
+        "audit_version": 3,
         "rules_version": RULES_VERSION,
         "content_version": CONTENT_VERSION,
         "candidates": plan["candidates"],
         "selected_action": plan["selected_action"],
         "pipeline": plan["pipeline"],
         "declaration": plan["declaration"],
-        "structured_changes": structured_changes,
+        "structured_changes": stored_changes,
+        "autonomy": autonomy,
+        "cognition": cognition,
         "permission": plan["permission"],
         "random": random_audit,
         "state_revision": {"before": state["revision"], "after": after_revision},

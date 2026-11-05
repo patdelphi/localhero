@@ -7,8 +7,9 @@ def advance_local_simulation(
     after_time: int,
     social_states: list[dict],
     local_plans: list[dict],
+    process_plans: bool = True,
 ) -> dict:
-    """仅处理当前行动中已经到期的固定事项，顺序完全确定。"""
+    """处理固定到期事项；第五阶段可关闭计划直写，只保留短期状态结束。"""
     result = {
         "plans": [],
         "states": [],
@@ -19,7 +20,8 @@ def advance_local_simulation(
     due_plans = sorted(
         (
             item for item in local_plans
-            if item["scope"] == "c01"
+            if process_plans
+            and item["scope"] == "c01"
             and item["status"] == "pending"
             and item["due_time"] <= after_time
         ),

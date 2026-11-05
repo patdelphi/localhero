@@ -4,7 +4,7 @@ import hashlib
 import json
 
 
-RULES_VERSION = "action-pipeline-1.1"
+RULES_VERSION = "action-pipeline-1.3"
 MESSAGE_KINDS = (
     "visible_expression",
     "action_intent",

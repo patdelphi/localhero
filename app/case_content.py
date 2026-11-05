@@ -1,6 +1,6 @@
 """程序说明：定义 C01《不存在的人》小型单案的固定地点、行动、线索和结局。"""
 
-CONTENT_VERSION = "c01-1.1"
+CONTENT_VERSION = "c01-1.3"
 
 # 行动前声明只补充展示元数据，机械后果仍由下方固定 effects 唯一决定。
 ACTION_METADATA = {
@@ -161,6 +161,128 @@ LOCAL_PLAN_DEFINITIONS = {
         "history": "方笙补充了旧排班中的共享账户备注。",
     },
 }
+
+# NPC 初始知识只代表人物自己知道的内容，不包含主持人或其他人物秘密。
+NPC_INITIAL_KNOWLEDGE = {
+    "fang_sheng": ["fang_sheng:old_shift_schedule"],
+}
+
+
+def initial_cognition(game_id, source_event_id):
+    """生成新档方笙的固定观察、来源记忆和个人过度推断。"""
+    definitions = [
+        ("old_shift_observation", "observation", None, "方笙观察过旧排班。", "direct"),
+        ("old_shift_schedule", "memory", "old_shift_observation", "方笙记得旧排班及共享账户备注。", "honest"),
+        ("last_login_observation", "observation", None, "方笙观察到邵谦凭证的最后登录记录。", "direct"),
+        ("last_login_memory", "memory", "last_login_observation", "方笙记得邵谦凭证的最后登录记录。", "honest"),
+        ("last_login_inference", "memory", "last_login_memory", "方笙推断：当晚只有邵谦使用凭证。", "honest"),
+    ]
+    records = []
+    for key, kind, source_key, content, accuracy in definitions:
+        source_id = f"{game_id}:fang_sheng:{source_key}" if source_key else None
+        records.append({
+            "id": f"{game_id}:fang_sheng:{key}",
+            "knowledge_id": f"{game_id}:fang_sheng:{key}",
+            "game_id": game_id,
+            "holder_id": "fang_sheng",
+            "kind": kind,
+            "source_event_id": source_event_id,
+            "fact_id": None,
+            "content": content,
+            "accuracy": accuracy,
+            "visibility": "private",
+            "source_record_id": source_id,
+            "observed_at": 0,
+            "precision": "exact",
+            "corrects_record_id": None,
+        })
+    return records
+
+# 固定候选只引用下方效果编号，模型和调用方不能提交任意效果 JSON。
+AUTONOMY_PLAN_DEFINITIONS = {
+    "fangsheng_followup": {
+        "candidates": [
+            {
+                "candidate_id": "share_schedule",
+                "effect_id": "share_schedule_testimony",
+                "requires_knowledge": ["fang_sheng:old_shift_schedule"],
+                "min_precision": {"fang_sheng:old_shift_schedule": "exact"},
+                "min_trust": 1,
+                "requires_memory": "优先确认苗雨安全",
+                "score": {"goal": 3, "knowledge": 2, "risk": 0},
+                "selection_reason_codes": [
+                    "protect_miaoyu", "safety_promise", "sufficient_trust",
+                ],
+            },
+            {
+                "candidate_id": "share_safe_reminder",
+                "effect_id": "share_safe_reminder_testimony",
+                "requires_knowledge": ["fang_sheng:old_shift_schedule"],
+                "min_precision": {"fang_sheng:old_shift_schedule": "vague"},
+                "score": {"goal": 1, "knowledge": 2, "risk": -1},
+                "selection_reason_codes": ["protect_miaoyu", "cautious_reminder"],
+            },
+            {
+                "candidate_id": "wait",
+                "effect_id": "wait_without_testimony",
+                "requires_knowledge": [],
+                "score": {"goal": 0, "knowledge": 0, "risk": 0},
+                "selection_reason_codes": ["wait_for_next_boundary"],
+            },
+        ],
+    },
+}
+
+AUTONOMY_EFFECT_DEFINITIONS = {
+    "share_schedule_testimony": {
+        "complete_plan": True,
+        "knowledge_source": "fang_sheng:old_shift_schedule",
+        "correction_id": "fang_sheng:last_login_retraction",
+        "testimony": LOCAL_PLAN_DEFINITIONS["fangsheng_followup"]["testimony"],
+        "history": LOCAL_PLAN_DEFINITIONS["fangsheng_followup"]["history"],
+        "public": LOCAL_PLAN_DEFINITIONS["fangsheng_followup"]["history"],
+    },
+    "share_safe_reminder_testimony": {
+        "complete_plan": True,
+        "knowledge_source": "fang_sheng:old_shift_schedule",
+        "testimony": {
+            "holder_id": "fang_sheng", "kind": "testimony", "fact_id": None,
+            "content": "方笙谨慎提醒：旧排班里有需要核对的共享账户。",
+            "accuracy": "honest", "visibility": "player",
+        },
+        "history": "方笙给出了一条谨慎的旧排班提醒。",
+        "public": "方笙给出了一条谨慎的旧排班提醒。",
+    },
+    "wait_without_testimony": {"complete_plan": False},
+}
+
+# 场景只负责固定呈现，不声明任何候选之外的机械效果。
+SCENE_DEFINITIONS = [
+    {
+        "scene_id": "fangsheng_remote_schedule",
+        "candidate_id": "share_schedule",
+        "plan_id": "fangsheng_followup",
+        "priority": 10,
+        "requires_relationship": "委托人",
+        "requires_knowledge": ["fang_sheng:old_shift_schedule"],
+        "min_precision": {"fang_sheng:old_shift_schedule": "exact"},
+        "channel": "remote_message",
+        "presentation_key": "fangsheng_remote_schedule",
+        "repeatable": False,
+    },
+    {
+        "scene_id": "fangsheng_remote_reminder",
+        "candidate_id": "share_safe_reminder",
+        "plan_id": "fangsheng_followup",
+        "priority": 10,
+        "requires_relationship": "委托人",
+        "requires_knowledge": ["fang_sheng:old_shift_schedule"],
+        "min_precision": {"fang_sheng:old_shift_schedule": "vague"},
+        "channel": "remote_message",
+        "presentation_key": "fangsheng_remote_reminder",
+        "repeatable": False,
+    },
+]
 
 ENDINGS = {
     "personal_review": "低调个人复核",

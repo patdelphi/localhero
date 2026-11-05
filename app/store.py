@@ -6,20 +6,24 @@ from pathlib import Path
 import sqlite3
 import uuid
 
-from app.action_protocol import IdempotencyConflict, StateConflict
+from app.action_protocol import IdempotencyConflict, RULES_VERSION, StateConflict
+from app.case_content import CONTENT_VERSION
 
 
 class Database:
     """封装存档读写；所有写入都在显式事务中完成。"""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        # 命名内存 URI 供隔离回放使用；普通存档仍统一转换为 Path。
+        self.uri = isinstance(path, str) and path.startswith("file:")
+        self.path = path if self.uri else Path(path)
 
     @contextmanager
     def connect(self):
         """建立带行工厂和外键约束的短连接，读取结束即关闭。"""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=30)
+        if not self.uri:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=30, uri=self.uri)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -41,7 +45,7 @@ class Database:
                 raise
 
     def initialize(self) -> "Database":
-        """在事务中创建或迁移到版本 4，并启用 WAL。"""
+        """在事务中创建或迁移到版本 6，并启用 WAL。"""
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -67,6 +71,10 @@ class Database:
         needs_v4_backfill = bool(has_game_table and version < 4)
         if needs_v4_backfill:
             self._backup_before_v4()
+        if has_game_table and version < 5:
+            self._backup_before_v5()
+        if has_game_table and version < 6:
+            self._backup_before_v6()
         schema = (
             """
             CREATE TABLE IF NOT EXISTS games (
@@ -162,6 +170,11 @@ class Database:
                 content TEXT NOT NULL,
                 accuracy TEXT NOT NULL,
                 visibility TEXT NOT NULL,
+                source_record_id TEXT REFERENCES knowledge_records(id),
+                observed_at INTEGER,
+                precision TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK(precision IN ('exact', 'vague', 'fragmentary', 'unknown')),
+                corrects_record_id TEXT REFERENCES knowledge_records(id),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(game_id, fact_id) REFERENCES case_facts(game_id, fact_id)
             )
@@ -215,6 +228,17 @@ class Database:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS replay_baselines (
+                game_id TEXT PRIMARY KEY REFERENCES games(id),
+                snapshot_json TEXT NOT NULL,
+                snapshot_format INTEGER NOT NULL,
+                rules_version TEXT NOT NULL,
+                content_version TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS player_hypotheses (
                 id TEXT PRIMARY KEY,
                 game_id TEXT NOT NULL REFERENCES games(id),
@@ -235,11 +259,20 @@ class Database:
             for statement in schema:
                 conn.execute(statement)
             self._migrate_columns(conn)
+            # v5 旧表须先补齐 v6 列，再创建依赖这些列的索引。
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_source_record "
+                "ON knowledge_records(game_id, source_record_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_corrects_record "
+                "ON knowledge_records(game_id, corrects_record_id)"
+            )
             if needs_v3_backfill:
                 self._backfill_v3(conn)
             if needs_v4_backfill:
                 self._backfill_v4(conn)
-            conn.execute("PRAGMA user_version=4")
+            conn.execute("PRAGMA user_version=6")
         return self
 
     def _backup_before_v2(self) -> None:
@@ -253,6 +286,14 @@ class Database:
     def _backup_before_v4(self) -> None:
         """保留首次升级到 v4 前的一致性快照。"""
         self._backup("pre-v4")
+
+    def _backup_before_v5(self) -> None:
+        """保留首次升级到 v5 前的一致性快照。"""
+        self._backup("pre-v5")
+
+    def _backup_before_v6(self) -> None:
+        """保留首次升级到 v6 前的一致性快照。"""
+        self._backup("pre-v6")
 
     def _backup(self, label: str) -> None:
         """使用 SQLite 在线备份；临时文件完成后原子替换目标。"""
@@ -298,6 +339,18 @@ class Database:
             conn.execute(
                 "ALTER TABLE case_states ADD COLUMN world_time INTEGER NOT NULL DEFAULT 0"
             )
+        knowledge_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(knowledge_records)").fetchall()
+        }
+        cognition_additions = {
+            "source_record_id": "TEXT",
+            "observed_at": "INTEGER",
+            "precision": "TEXT NOT NULL DEFAULT 'unknown'",
+            "corrects_record_id": "TEXT",
+        }
+        for name, sql_type in cognition_additions.items():
+            if name not in knowledge_columns:
+                conn.execute(f"ALTER TABLE knowledge_records ADD COLUMN {name} {sql_type}")
         conn.execute(
             """
             UPDATE actions
@@ -449,24 +502,45 @@ class Database:
             )
 
     def create_game(self, protagonist: str) -> dict:
-        """创建固定于 OC-01 的新存档，并写入开场事件。"""
+        """创建新档，并在同一事务写入开场、案件投影与回放基线。"""
+        # 延迟导入避免存储模块与回放模块在加载时形成循环依赖。
+        from app.replay_engine import canonical_json, make_initial_snapshot, snapshot_hash
+
         game_id = uuid.uuid4().hex
         opening = "雨敲着事务所的旧窗。唐葵坐在案件板旁，桌上的终端还亮着。你可以查看现场、检查终端，或和她谈谈。"
+        snapshot_json = canonical_json(make_initial_snapshot(protagonist))
         with self.transaction() as conn:
             conn.execute(
                 "INSERT INTO games(id, protagonist, location, seed) VALUES (?, ?, ?, ?)",
                 (game_id, protagonist, "OC-01", 20261103),
             )
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, NULL, ?, ?)",
                 (game_id, "game_started", json.dumps({"text": opening}, ensure_ascii=False)),
             )
+            from app.case_content import initial_cognition
+            for record in initial_cognition(game_id, cursor.lastrowid):
+                self._insert_knowledge_record(
+                    conn, game_id, cursor.lastrowid, record
+                )
             conn.execute(
                 """
                 INSERT INTO case_states(game_id, phase, location, clock, clues_json, ending, revision)
                 VALUES (?, 'unoffered', 'OC-01', 0, '[]', NULL, 0)
                 """,
                 (game_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO replay_baselines(
+                    game_id, snapshot_json, snapshot_format,
+                    rules_version, content_version, snapshot_hash
+                ) VALUES (?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    game_id, snapshot_json, RULES_VERSION, CONTENT_VERSION,
+                    snapshot_hash(snapshot_json),
+                ),
             )
         return self.get_game(game_id)
 
@@ -533,17 +607,46 @@ class Database:
         return [dict(row) for row in rows]
 
     def get_player_knowledge(self, game_id: str) -> list[dict]:
-        """只返回明确授权给玩家的观察、记忆与证词。"""
+        """返回玩家认知；只有来源和目标均公开时才保留对应引用。"""
         with self.connect() as conn:
-            rows = conn.execute(
+            rows = [dict(row) for row in conn.execute(
                 """
                 SELECT * FROM knowledge_records
                 WHERE game_id=? AND visibility='player'
                 ORDER BY source_event_id, rowid
                 """,
                 (game_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+            ).fetchall()]
+        visible_ids = {row["id"] for row in rows}
+        result = []
+        for row in rows:
+            corrected_by = [
+                item["id"] for item in rows
+                if item.get("corrects_record_id") == row["id"]
+            ]
+            result.append({
+                "knowledge_id": row["id"],
+                "holder_id": row["holder_id"],
+                "kind": row["kind"],
+                "source_event_id": row["source_event_id"],
+                "fact_id": row["fact_id"],
+                "content": row["content"],
+                "accuracy": row["accuracy"],
+                "visibility": row["visibility"],
+                "source_record_id": (
+                    row["source_record_id"]
+                    if row["source_record_id"] in visible_ids else None
+                ),
+                "observed_at": row["observed_at"],
+                "precision": row["precision"],
+                "corrects_record_id": (
+                    row["corrects_record_id"]
+                    if row["corrects_record_id"] in visible_ids else None
+                ),
+                "has_correction": bool(corrected_by),
+                "corrected_by": corrected_by,
+            })
+        return result
 
     def get_social_states(self, game_id: str) -> list[dict]:
         """读取社会结构投影；私密字段仅供规则引擎内部使用。"""
@@ -584,6 +687,59 @@ class Database:
                 (game_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_decision_context(self, game_id: str) -> dict:
+        """在单次一致性读取中取得NPC决策和并发哈希所需的全部输入。"""
+        with self.connect() as conn:
+            return self._decision_context_from_conn(conn, game_id)
+
+    @staticmethod
+    def _decision_context_from_conn(conn: sqlite3.Connection, game_id: str) -> dict:
+        """从事务内当前投影构造规范上下文，不读取玩家私人假设。"""
+        from app.npc_decision import make_decision_context
+
+        game = conn.execute("SELECT * FROM games WHERE id=?", (game_id,)).fetchone()
+        if game is None:
+            raise KeyError("存档不存在")
+        case_row = conn.execute(
+            "SELECT * FROM case_states WHERE game_id=?", (game_id,)
+        ).fetchone()
+        if case_row is None:
+            from app.case_engine import initial_state
+            case = initial_state()
+        else:
+            case = dict(case_row)
+            case["clues"] = json.loads(case.pop("clues_json"))
+        social = [dict(row) for row in conn.execute(
+            "SELECT * FROM social_states WHERE game_id=? ORDER BY rowid", (game_id,)
+        ).fetchall()]
+        plans = [dict(row) for row in conn.execute(
+            "SELECT * FROM local_plans WHERE game_id=? ORDER BY due_time, plan_id",
+            (game_id,),
+        ).fetchall()]
+        knowledge = [dict(row) for row in conn.execute(
+            "SELECT * FROM knowledge_records WHERE game_id=? ORDER BY source_event_id, rowid",
+            (game_id,),
+        ).fetchall()]
+        history = [
+            {**dict(row), "structured": json.loads(row["structured_json"])}
+            for row in conn.execute(
+                "SELECT * FROM character_history WHERE game_id=? "
+                "ORDER BY source_event_id, id", (game_id,)
+            ).fetchall()
+        ]
+        events = [
+            {"kind": row["kind"], "payload": json.loads(row["payload_json"])}
+            for row in conn.execute(
+                "SELECT kind, payload_json FROM events "
+                "WHERE game_id=? AND kind='scene_activated' ORDER BY id", (game_id,)
+            ).fetchall()
+        ]
+        context = make_decision_context(
+            case, social, plans, knowledge, history, events, game["roll_count"]
+        )
+        context["game_id"] = game_id
+        return context
 
     def invalidate_fact(self, game_id: str, fact_id: str, reason: str) -> None:
         """追加失效事件并同步投影；事实和来源历史不会被删除。"""
@@ -654,8 +810,9 @@ class Database:
         declaration: dict | None = None,
         audit: dict | None = None,
         structured_changes: dict | None = None,
+        expected_decision_context_hash: str | None = None,
     ) -> dict:
-        """事务内复核并提交行动、结构化记录与案件投影。"""
+        """事务内复核版本、随机序号和决策上下文，再提交全部领域状态。"""
         action_id = uuid.uuid4().hex
         with self.transaction() as conn:
             if request_hash is not None:
@@ -680,6 +837,12 @@ class Database:
                 raise StateConflict("案件状态已变化，请重新预览")
             if expected_roll_count is not None and game["roll_count"] != expected_roll_count:
                 raise StateConflict("随机序号已变化，请重新预览")
+            if expected_decision_context_hash is not None:
+                from app.npc_decision import decision_context_hash
+
+                current_context = self._decision_context_from_conn(conn, game_id)
+                if decision_context_hash(current_context) != expected_decision_context_hash:
+                    raise StateConflict("决策上下文已变化，请重新预览")
 
             conn.execute(
                 """
@@ -797,6 +960,9 @@ class Database:
                     structured_changes.get("simulation", {}),
                     structured_changes.get("world_time", {}).get("after", 0),
                 )
+                self._apply_scene_changes(
+                    conn, game_id, action_id, structured_changes.get("scenes", [])
+                )
         return self.get_action(game_id, action_id)
 
     @staticmethod
@@ -892,25 +1058,78 @@ class Database:
             )
 
         for record in knowledge:
-            conn.execute(
-                """
-                INSERT INTO knowledge_records(
-                    id, game_id, holder_id, kind, source_event_id,
-                    fact_id, content, accuracy, visibility
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.get("id") or uuid.uuid4().hex,
-                    game_id,
-                    record["holder_id"],
-                    record["kind"],
-                    source_event_id,
-                    record.get("fact_id"),
-                    record["content"],
-                    record["accuracy"],
-                    record["visibility"],
-                ),
+            Database._insert_knowledge_record(
+                conn, game_id, source_event_id, record
             )
+
+    @staticmethod
+    def _insert_knowledge_record(conn, game_id, source_event_id, record):
+        """校验同档同持有者来源与纠正顺序，再写入不可变认知记录。"""
+        kind = record.get("kind")
+        precision = record.get("precision", "unknown")
+        holder_id = record.get("holder_id")
+        if kind not in {"observation", "memory", "testimony"}:
+            raise ValueError("认知记录类型非法")
+        if precision not in {"exact", "vague", "fragmentary", "unknown"}:
+            raise ValueError("认知精度枚举非法")
+        if record.get("visibility") not in {"public", "player", "private"}:
+            raise ValueError("认知可见性非法")
+        observed_at = record.get("observed_at")
+        if (
+            kind in {"observation", "memory"} and precision != "unknown"
+            and (type(observed_at) is not int or observed_at < 0)
+        ):
+            raise ValueError("新观察或记忆必须有合法观察时间")
+        source_id = record.get("source_record_id")
+        if kind in {"memory", "testimony"} and precision != "unknown" and not source_id:
+            raise ValueError("新记忆或证词必须有明确认知来源")
+        if source_id is not None:
+            source = conn.execute(
+                "SELECT holder_id, source_event_id FROM knowledge_records "
+                "WHERE id=? AND game_id=?",
+                (source_id, game_id),
+            ).fetchone()
+            if source is None or source["holder_id"] != holder_id:
+                raise ValueError("认知来源必须存在且属于同一持有者")
+            if source["source_event_id"] > source_event_id:
+                raise ValueError("认知来源事件不能晚于当前记录")
+        target_id = record.get("corrects_record_id")
+        if target_id is not None:
+            target = conn.execute(
+                "SELECT holder_id, source_event_id FROM knowledge_records "
+                "WHERE id=? AND game_id=?",
+                (target_id, game_id),
+            ).fetchone()
+            if target is None or target["holder_id"] != holder_id:
+                raise ValueError("纠正目标必须存在且属于同一持有者")
+            if target_id == record.get("id") or target["source_event_id"] >= source_event_id:
+                raise ValueError("纠正目标必须早于当前记录且不能自指")
+            if record.get("fact_id") is not None:
+                raise ValueError("追加纠正不能授予新的事实")
+        conn.execute(
+            """
+            INSERT INTO knowledge_records(
+                id, game_id, holder_id, kind, source_event_id,
+                fact_id, content, accuracy, visibility,
+                source_record_id, observed_at, precision, corrects_record_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("id") or uuid.uuid4().hex,
+                game_id,
+                holder_id,
+                kind,
+                source_event_id,
+                record.get("fact_id"),
+                record["content"],
+                record["accuracy"],
+                record["visibility"],
+                source_id,
+                observed_at,
+                precision,
+                target_id,
+            ),
+        )
 
     @staticmethod
     def _insert_history(
@@ -1095,27 +1314,44 @@ class Database:
                 (event_id, game_id, state["state_id"]),
             )
         for record in knowledge:
-            conn.execute(
-                """
-                INSERT INTO knowledge_records(
-                    id, game_id, holder_id, kind, source_event_id,
-                    fact_id, content, accuracy, visibility
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    game_id,
-                    record["holder_id"],
-                    record["kind"],
-                    event_id,
-                    record.get("fact_id"),
-                    record["content"],
-                    record["accuracy"],
-                    record["visibility"],
-                ),
-            )
+            Database._insert_knowledge_record(conn, game_id, event_id, record)
         for record in history:
             Database._insert_history(conn, game_id, event_id, record)
+
+    @staticmethod
+    def _apply_scene_changes(
+        conn: sqlite3.Connection,
+        game_id: str,
+        action_id: str,
+        scenes: list[dict],
+    ) -> None:
+        """只持久化固定场景的公开选择事实，不保存评分或私密知识。"""
+        from app.case_content import CONTENT_VERSION, SCENE_DEFINITIONS
+        from app.action_protocol import RULES_VERSION
+
+        expected_keys = {
+            "scene_id", "plan_id", "holder_id", "candidate_id", "channel",
+            "presentation_key", "rules_version", "content_version",
+        }
+        for scene in scenes:
+            if set(scene) != expected_keys:
+                raise ValueError("场景事件字段不完整或包含未声明字段")
+            definition = next(
+                (item for item in SCENE_DEFINITIONS if item["scene_id"] == scene["scene_id"]),
+                None,
+            )
+            if definition is None or any(
+                scene[key] != definition[key]
+                for key in ("plan_id", "candidate_id", "channel", "presentation_key")
+            ):
+                raise ValueError("场景事件与固定内容定义不一致")
+            if scene["rules_version"] != RULES_VERSION or scene["content_version"] != CONTENT_VERSION:
+                raise ValueError("场景事件版本与当前规则不一致")
+            conn.execute(
+                "INSERT INTO events(game_id, action_id, kind, payload_json) "
+                "VALUES (?, ?, 'scene_activated', ?)",
+                (game_id, action_id, json.dumps(scene, ensure_ascii=False)),
+            )
 
     def get_action(self, game_id: str, action_id: str) -> dict:
         """读取行动并反序列化已保存的协议、判定、审计和响应。"""
@@ -1208,6 +1444,28 @@ class Database:
                 """,
                 (game_id,),
             ).fetchall()
+            visible_knowledge_ids = {
+                row[0] for row in conn.execute(
+                    "SELECT id FROM knowledge_records WHERE game_id=? AND visibility='player'",
+                    (game_id,),
+                ).fetchall()
+            }
+
+        def public_record(item):
+            source_id = item.get("source_record_id")
+            target_id = item.get("corrects_record_id")
+            return {
+                "knowledge_id": item.get("knowledge_id") or item.get("id"),
+                "holder_id": item.get("holder_id"),
+                "kind": item.get("kind"),
+                "content": item.get("content"),
+                "accuracy": item.get("accuracy"),
+                "visibility": item.get("visibility"),
+                "precision": item.get("precision", "unknown"),
+                "source_record_id": source_id if source_id in visible_knowledge_ids else None,
+                "corrects_record_id": target_id if target_id in visible_knowledge_ids else None,
+            }
+
         events_by_action = {}
         for event in event_rows:
             events_by_action.setdefault(event["action_id"], []).append(dict(event))
@@ -1227,6 +1485,56 @@ class Database:
                     item for item in social.get("history", [])
                     if item.get("visibility") in {"public", "player"}
                 ]
+            structured["knowledge"] = [
+                public_record(item) for item in structured.get("knowledge", [])
+                if item.get("visibility") == "player"
+            ]
+            simulation = structured.get("simulation")
+            if simulation:
+                simulation["knowledge"] = [
+                    public_record(item) for item in simulation.get("knowledge", [])
+                    if item.get("visibility") == "player"
+                ]
+            cognition = audit.get("cognition")
+            if cognition:
+                audit["cognition"] = {
+                    "world_time": cognition.get("world_time"),
+                    "records": [
+                        public_record(item) for item in cognition.get("records", [])
+                        if item.get("visibility") == "player"
+                    ],
+                    "decay": [],
+                }
+            autonomy = audit.get("autonomy")
+            if autonomy:
+                # 玩家只看公开回应和最终选择，内部知识、评分及排除理由不下发。
+                audit["autonomy"] = {
+                    "responses": [
+                        {
+                            key: item.get(key) for key in (
+                                "response_id", "response_kind", "reason_codes",
+                                "public_text_key",
+                            )
+                        }
+                        for item in autonomy.get("responses", [])
+                    ],
+                    "decisions": [
+                        {
+                            key: item.get(key) for key in (
+                                "plan_id", "holder_id", "selected_candidate_id",
+                                "selection_reason_codes",
+                            )
+                        }
+                        for item in autonomy.get("decisions", [])
+                    ],
+                    "scenes": [
+                        {
+                            key: item.get(key)
+                            for key in ("scene_id", "candidate_id", "selected")
+                        }
+                        for item in autonomy.get("scenes", []) if item.get("selected")
+                    ],
+                }
             result.append(
                 {
                     "action_id": action["id"],
@@ -1252,7 +1560,7 @@ class Database:
         response = self._pending_response(action)
         response.update({"status": "complete", "narrative": narrative})
         audit = action["audit"]
-        if audit.get("audit_version") == 1:
+        if audit.get("audit_version") in {1, 2, 3}:
             audit = {**audit, "status": "complete"}
         with self.transaction() as conn:
             cursor = conn.execute(

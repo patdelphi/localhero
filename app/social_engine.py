@@ -1,4 +1,50 @@
-"""程序说明：以纯函数计算 C01 固定行动产生的社会状态、同源履历与计划。"""
+"""程序说明：以纯函数判断NPC回应，并计算获准的社交状态、履历与计划。"""
+
+
+def judge_social_response(action, outcome, social_states, local_plans):
+    """先判断NPC如何回应，再决定是否允许固定社交效果生效。"""
+    if action["id"] != "reassure_fangsheng":
+        return None
+    if outcome != "no_roll":
+        return {
+            "response_id": "fangsheng_evaded",
+            "response_kind": "evade",
+            "reason_codes": ["outcome_not_applicable"],
+            "public_text_key": "fangsheng_evaded_response",
+            "allow_social_effects": False,
+        }
+    has_commission = any(
+        item.get("state_id") == "fang_sheng:player:relationship"
+        and item.get("value_text") == "委托人"
+        and item.get("status") == "active"
+        for item in social_states
+    )
+    if not has_commission:
+        return {
+            "response_id": "fangsheng_refused",
+            "response_kind": "refuse",
+            "reason_codes": ["valid_commission_missing"],
+            "public_text_key": "fangsheng_refused_response",
+            "allow_social_effects": False,
+        }
+    repeated = any(
+        item.get("state_id") == "fang_sheng:player:trust" for item in social_states
+    ) or any(item.get("plan_id") == "fangsheng_followup" for item in local_plans)
+    if repeated:
+        return {
+            "response_id": "fangsheng_already_reassured",
+            "response_kind": "conditional",
+            "reason_codes": ["safety_promise_already_recorded"],
+            "public_text_key": "fangsheng_already_reassured_response",
+            "allow_social_effects": False,
+        }
+    return {
+        "response_id": "fangsheng_reassured",
+        "response_kind": "accept",
+        "reason_codes": ["valid_commission", "safety_promise"],
+        "public_text_key": "fangsheng_reassured_response",
+        "allow_social_effects": True,
+    }
 
 
 def build_social_changes(
@@ -7,8 +53,9 @@ def build_social_changes(
     after_time: int,
     social_states: list[dict],
     local_plans: list[dict],
+    response: dict | None = None,
 ) -> dict:
-    """只展开固定社交声明；重复安抚不会叠加信任、记忆或计划。"""
+    """只展开回应者允许的固定社交声明；重复安抚不会叠加效果。"""
     empty = {"states": [], "history": [], "plans": [], "public": []}
     if outcome != "no_roll":
         return empty
@@ -48,6 +95,11 @@ def build_social_changes(
         }
 
     if action["id"] != "reassure_fangsheng":
+        return empty
+    response = response or judge_social_response(
+        action, outcome, social_states, local_plans
+    )
+    if not response["allow_social_effects"]:
         return empty
     trust_id = "fang_sheng:player:trust"
     condition_id = "fang_sheng:condition:reassured"

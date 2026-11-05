@@ -1,4 +1,4 @@
-/* 程序说明：连接本地 FastAPI，处理行动预览、确认提交、公开判定和只读审计。 */
+/* 程序说明：连接本地 FastAPI，处理行动、只读审计、历史时间线与隔离机械回放。 */
 "use strict";
 
 const state = {
@@ -8,6 +8,9 @@ const state = {
   pendingRequest: null,
   pendingNarrativeId: null,
   auditOpen: false,
+  timelineOpen: false,
+  replayBusy: false,
+  replayAvailable: true,
   editingHypothesisId: null,
 };
 
@@ -29,6 +32,12 @@ const elements = {
   auditPanel: document.querySelector("#audit-panel"),
   auditList: document.querySelector("#audit-list"),
   toggleAudit: document.querySelector("#toggle-audit"),
+  timelinePanel: document.querySelector("#timeline-panel"),
+  timelineList: document.querySelector("#timeline-list"),
+  timelineNote: document.querySelector("#timeline-note"),
+  toggleTimeline: document.querySelector("#toggle-timeline"),
+  verifyLatest: document.querySelector("#verify-latest"),
+  replayResult: document.querySelector("#replay-result"),
   knowledgeList: document.querySelector("#knowledge-list"),
   planList: document.querySelector("#plan-list"),
   historyList: document.querySelector("#history-list"),
@@ -78,6 +87,13 @@ const accuracyLabels = {
   unknown: "准确性未知",
 };
 
+const precisionLabels = {
+  exact: "清晰",
+  vague: "模糊",
+  fragmentary: "破碎",
+  unknown: "精度未知",
+};
+
 const declarationLabels = {
   target: "目标",
   method: "方法",
@@ -125,6 +141,14 @@ function showGame(gameId) {
   document.querySelector("#game-id").textContent = gameId;
 }
 
+function publicSceneText(scene) {
+  const texts = {
+    fangsheng_remote_schedule: "方笙通过远程联系补充了旧排班中的共享账户备注。",
+    fangsheng_remote_reminder: "方笙通过远程联系给出了一条谨慎的旧排班提醒。",
+  };
+  return texts[scene.scene_id] || "公开远程场景已激活";
+}
+
 function renderEvent(event) {
   const article = document.createElement("article");
   const label = document.createElement("span");
@@ -160,6 +184,9 @@ function renderEvent(event) {
   } else if (event.kind === "local_simulation_advanced") {
     label.textContent = "局部推进";
     body.textContent = event.payload.changes?.join("；") || "固定计划或短期状态已到期";
+  } else if (event.kind === "scene_activated") {
+    label.textContent = "远程场景";
+    body.textContent = publicSceneText(event.payload);
   } else {
     label.textContent = "场景";
     body.textContent = event.payload.text || "事件已记录";
@@ -275,7 +302,8 @@ function renderKnowledge(items) {
     const content = document.createElement("p");
     const meta = document.createElement("small");
     content.textContent = item.content;
-    meta.textContent = `${knowledgeKindLabels[item.kind] || item.kind} · ${holderLabels[item.holder_id] || item.holder_id} · ${accuracyLabels[item.accuracy] || item.accuracy} · 来源事件 #${item.source_event_id}`;
+    const correction = item.has_correction ? " · 已有纠正" : "";
+    meta.textContent = `${knowledgeKindLabels[item.kind] || item.kind} · ${holderLabels[item.holder_id] || item.holder_id} · ${accuracyLabels[item.accuracy] || item.accuracy} · ${precisionLabels[item.precision] || precisionLabels.unknown}${correction} · 来源事件 #${item.source_event_id}`;
     entry.append(content, meta);
     elements.knowledgeList.appendChild(entry);
   });
@@ -381,6 +409,7 @@ async function loadGame(gameId) {
   elements.sceneLog.lastElementChild?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   await loadCaseBoard();
   if (state.auditOpen) await loadAudit();
+  if (state.timelineOpen) await loadTimeline();
 }
 
 async function createGame(event) {
@@ -577,6 +606,23 @@ function renderAudit(entries) {
     auditSection(details, "随机", [audit.random
       ? `种子 ${audit.random.seed} · 序号 ${audit.random.sequence} · [${audit.random.dice.join(" + ")}] + ${audit.random.modifier} = ${audit.random.total} · ${audit.random.outcome}`
       : "本次行动未掷骰"]);
+    // 仅展示服务端已裁剪的公开证词及其公开纠正目标。
+    const cognitionLines = (audit.cognition?.records || [])
+      .filter((item) => item.kind === "testimony")
+      .map((item) => {
+        const correction = item.corrects_record_id
+          ? ` · 纠正公开证词 ${item.corrects_record_id}`
+          : "";
+        return `${holderLabels[item.holder_id] || item.holder_id} · ${precisionLabels[item.precision] || precisionLabels.unknown}：${item.content}${correction}`;
+      });
+    if (cognitionLines.length) auditSection(details, "认知与纠正", cognitionLines);
+    const autonomy = audit.autonomy || { responses: [], decisions: [], scenes: [] };
+    const autonomyLines = [
+      ...autonomy.responses.map((item) => `NPC回应：${item.response_kind}`),
+      ...autonomy.decisions.map((item) => `最终候选：${item.selected_candidate_id || "无"}`),
+      ...autonomy.scenes.map((item) => `场景：${publicSceneText(item)}`),
+    ];
+    if (autonomyLines.length) auditSection(details, "NPC回应与场景", autonomyLines);
     auditSection(details, "关联事件", entry.events.map(
       (event) => `#${event.id} ${event.kind}`,
     ));
@@ -587,6 +633,142 @@ function renderAudit(entries) {
 async function loadAudit() {
   const data = await api(`/api/games/${state.gameId}/audit?limit=50`);
   renderAudit(data.items);
+}
+
+function timelineEventText(event) {
+  if (event.kind === "case_changed") {
+    const parts = [
+      `案件变化：${phaseLabels[event.phase] || event.phase || "状态已更新"}`,
+      `位置 ${event.location || "未变"}`,
+      `项目清理 ${event.clock ?? 0} / 4`,
+      `时间 ${event.world_time ?? 0}`,
+    ];
+    if (event.ending) parts.push(`结局：${event.ending}`);
+    return parts.join(" · ");
+  }
+  if (event.kind === "social_changed") {
+    return `社会变化：${event.changes?.join("；") || "公开关系已更新"}`;
+  }
+  if (event.kind === "local_simulation_advanced") {
+    return `局部推进：${event.changes?.join("；") || "固定事项已到期"}`;
+  }
+  if (event.kind === "scene_activated") return publicSceneText(event);
+  if (event.kind === "narrative_completed") return event.text || "叙事已完成";
+  if (event.kind.startsWith("legacy_")) return "旧档迁移记录（未补造历史）";
+  return "行动已提交";
+}
+
+function setReplayBusy(busy) {
+  state.replayBusy = busy;
+  elements.verifyLatest.disabled = busy || !state.replayAvailable;
+  elements.timelineList.querySelectorAll("[data-replay-action]").forEach((button) => {
+    button.disabled = busy || !state.replayAvailable;
+  });
+}
+
+function renderReplayResult(result) {
+  elements.replayResult.classList.toggle("mismatch", result.status === "mismatched");
+  if (result.status === "matched") {
+    elements.replayResult.textContent = `一致：已独立重算并核对 ${result.checked_actions} 个行动，未发现机械差异。`;
+    return;
+  }
+  if (result.status === "unavailable") {
+    elements.replayResult.textContent = `无法校验：${result.reason.message}（${result.reason.code}）`;
+    return;
+  }
+  const mismatch = result.first_mismatch;
+  const paths = mismatch.differences.map((difference) => (
+    difference.redacted ? "私密状态（内容已隐藏）" : difference.path
+  ));
+  elements.replayResult.textContent = [
+    `发现不一致：首个差异位于第 ${mismatch.action_index} 个行动“${mismatch.input}”。`,
+    `已完整核对前 ${result.checked_actions} 个行动。`,
+    `差异字段：${paths.join("；")}`,
+  ].join("\n");
+}
+
+function renderTimeline(data) {
+  state.replayAvailable = data.baseline.available;
+  elements.timelineNote.textContent = state.replayAvailable
+    ? `基线 ${data.baseline.rules_version} / ${data.baseline.content_version}。机械校验不调用模型、不重新掷骰、不修改当前存档。`
+    : "缺少初始基线，仅可查看历史；此旧档无法执行机械回放。";
+  elements.replayResult.textContent = "";
+  elements.replayResult.classList.remove("mismatch");
+  elements.timelineList.replaceChildren();
+
+  data.items.forEach((item) => {
+    const article = document.createElement("article");
+    const heading = document.createElement("h3");
+    article.className = "timeline-item";
+    if (item.kind === "game_started") {
+      heading.textContent = "开场";
+      const text = document.createElement("p");
+      text.textContent = item.text;
+      article.append(heading, text);
+    } else if (item.kind === "action") {
+      heading.textContent = `行动 ${item.action_index} · ${item.input}`;
+      const meta = document.createElement("small");
+      const revisions = item.revision_after === null || item.revision_after === undefined
+        ? "旧记录无版本"
+        : `状态版本 ${item.revision_before} → ${item.revision_after}`;
+      meta.textContent = `${item.selected_action.label || item.selected_action.kind} · ${item.status} · 游戏内时间 ${item.world_time} · ${revisions}`;
+      article.append(heading, meta);
+
+      if (item.roll) {
+        const roll = document.createElement("p");
+        roll.textContent = `2D6 [${item.roll.dice.join(" + ")}] + ${item.roll.modifier} = ${item.roll.total} · ${item.roll.outcome}`;
+        article.appendChild(roll);
+      }
+      item.events.forEach((event) => {
+        const text = document.createElement("p");
+        text.textContent = timelineEventText(event);
+        article.appendChild(text);
+      });
+      if (item.narrative) {
+        const narrative = document.createElement("p");
+        narrative.textContent = item.narrative;
+        article.appendChild(narrative);
+      }
+      const verify = document.createElement("button");
+      verify.type = "button";
+      verify.className = "text-button";
+      verify.dataset.replayAction = item.action_id;
+      verify.textContent = "校验至此";
+      verify.disabled = state.replayBusy || !state.replayAvailable;
+      verify.addEventListener("click", () => verifyReplay(item.action_id));
+      article.appendChild(verify);
+    } else {
+      heading.textContent = "旧档迁移";
+      const text = document.createElement("p");
+      text.textContent = timelineEventText(item.event);
+      article.append(heading, text);
+    }
+    elements.timelineList.appendChild(article);
+  });
+  setReplayBusy(state.replayBusy);
+}
+
+async function loadTimeline() {
+  const data = await api(`/api/games/${state.gameId}/timeline`);
+  renderTimeline(data);
+}
+
+async function verifyReplay(throughActionId = null) {
+  if (state.replayBusy || !state.replayAvailable) return;
+  setReplayBusy(true);
+  elements.replayResult.classList.remove("mismatch");
+  elements.replayResult.textContent = "正在独立重算；不会调用模型或写入当前存档。";
+  try {
+    const result = await api(`/api/games/${state.gameId}/replay/verify`, {
+      method: "POST",
+      body: JSON.stringify(throughActionId ? { through_action_id: throughActionId } : {}),
+    });
+    renderReplayResult(result);
+  } catch (error) {
+    elements.replayResult.textContent = `校验请求失败：${error.message}`;
+  } finally {
+    setReplayBusy(false);
+  }
 }
 
 document.querySelector("#new-game-form").addEventListener("submit", createGame);
@@ -619,6 +801,20 @@ elements.toggleAudit.addEventListener("click", async () => {
     }
   }
 });
+elements.toggleTimeline.addEventListener("click", async () => {
+  state.timelineOpen = !state.timelineOpen;
+  elements.timelinePanel.hidden = !state.timelineOpen;
+  elements.toggleTimeline.setAttribute("aria-expanded", String(state.timelineOpen));
+  elements.toggleTimeline.textContent = state.timelineOpen ? "收起历史时间线" : "查看历史时间线";
+  if (state.timelineOpen) {
+    try {
+      await loadTimeline();
+    } catch (error) {
+      elements.replayResult.textContent = `历史读取失败：${error.message}`;
+    }
+  }
+});
+elements.verifyLatest.addEventListener("click", () => verifyReplay());
 document.querySelector("#copy-id").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(state.gameId);

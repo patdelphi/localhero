@@ -35,6 +35,12 @@ class ActionRequest(PreviewRequest):
     expected_revision: int | None = Field(default=None, ge=0)
 
 
+class ReplayRequest(BaseModel):
+    """可选目标行动用于把机械校验限制在历史前缀。"""
+
+    through_action_id: str | None = Field(default=None, max_length=100)
+
+
 class HypothesisRequest(BaseModel):
     """玩家假设只包含可编辑文本，不接受机械状态字段。"""
 
@@ -44,7 +50,7 @@ class HypothesisRequest(BaseModel):
 def create_app(db_path: str | Path, model: SimulatedModel | None = None) -> FastAPI:
     """创建可注入临时数据库和模拟模型的应用，便于隔离测试。"""
     service = GameService(Database(db_path).initialize(), model or SimulatedModel())
-    app = FastAPI(title="灰区事务所", version="0.3.0")
+    app = FastAPI(title="灰区事务所", version="0.4.0")
     app.state.service = service
 
     @app.exception_handler(KeyError)
@@ -83,6 +89,14 @@ def create_app(db_path: str | Path, model: SimulatedModel | None = None) -> Fast
     @app.get("/api/games/{game_id}")
     def get_game(game_id: str):
         return service.get_game(game_id)
+
+    @app.get("/api/games/{game_id}/timeline")
+    def get_timeline(game_id: str):
+        return service.get_timeline(game_id)
+
+    @app.post("/api/games/{game_id}/replay/verify")
+    def verify_replay(game_id: str, request: ReplayRequest):
+        return service.verify_replay(game_id, request.through_action_id)
 
     @app.get("/api/games/{game_id}/knowledge")
     def get_knowledge(game_id: str):

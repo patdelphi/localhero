@@ -166,6 +166,21 @@
           <div id="audit-list" class="audit-list"></div>
         </div>
       </section>
+
+      <section class="audit-dock" aria-labelledby="timeline-title">
+        <div class="column-heading">
+          <h2 id="timeline-title">历史与回放</h2>
+          <button id="toggle-timeline" class="text-button" type="button" aria-expanded="false">查看历史时间线</button>
+        </div>
+        <div id="timeline-panel" hidden>
+          <p id="timeline-note" class="audit-note">机械校验从初始基线重算已保存行动，不调用模型、不修改当前存档。</p>
+          <div class="replay-controls">
+            <button id="verify-latest" class="secondary" type="button">校验至最新行动</button>
+          </div>
+          <div id="replay-result" class="replay-result" aria-live="polite"></div>
+          <div id="timeline-list" class="timeline-list"></div>
+        </div>
+      </section>
     </section>
   </main>
 
