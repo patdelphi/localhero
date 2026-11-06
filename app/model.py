@@ -14,6 +14,16 @@ class SimulatedModel:
         self.fail_parse = fail_parse
         self.fail_narrative_times = fail_narrative_times
 
+    def stats(self) -> dict:
+        """模拟模型不发起网络请求，统计值恒为零。"""
+        return {
+            "requests": 0,
+            "failures": 0,
+            "fallbacks": 0,
+            "total_ms": 0.0,
+            "last_ms": 0.0,
+        }
+
     def parse_action(self, text: str, legal_actions: list[dict] | None = None) -> dict:
         """优先匹配当前地点的合法案件行动；无法识别时回退到通用观察行动。"""
         if self.fail_parse:
@@ -59,7 +69,28 @@ class SimulatedModel:
             "modifier": 0,
         }
 
-    def narrate(self, intent: dict, roll: dict | None) -> str:
+    def propose_director(self, context: dict) -> dict | None:
+        """按公开效果白名单确定性选择一条提案，不生成展示文本。"""
+        effects = context.get("可选效果") or []
+        if not effects:
+            return None
+        effect = effects[int(context.get("动作序号", 0)) % len(effects)]
+        return {
+            "beat_type": "environment_complication",
+            "effect_id": effect["effect_id"],
+            "target_action": context.get("当前行动编号"),
+            "reason": "环境出现新的公开变化。",
+            "source": "simulated",
+        }
+
+    def narrate(
+        self,
+        intent: dict,
+        roll: dict | None,
+        context: dict | None = None,
+        previous_narratives: list[str] | None = None,
+        action_content: dict | None = None,
+    ) -> str:
         """只描述已提交的意图和判定，不创造新的物品、线索或状态。"""
         if self.fail_narrative_times > 0:
             self.fail_narrative_times -= 1
@@ -67,7 +98,7 @@ class SimulatedModel:
 
         kind = intent["kind"]
         if kind == "case_action":
-            action = self._action_by_id(intent["action_id"])
+            action = action_content or self._action_by_id(intent["action_id"])
             outcome = roll["outcome"] if roll else "no_roll"
             narratives = action["narratives"]
             return narratives.get(outcome) or next(iter(narratives.values()))

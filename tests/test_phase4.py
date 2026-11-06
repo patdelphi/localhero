@@ -60,7 +60,7 @@ def test_v5_baseline_is_canonical_and_new_game_is_atomic(tmp_path):
     service, db = make_service(tmp_path)
     game_id = service.create_game("江逢")["id"]
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
         baseline = conn.execute(
             "SELECT * FROM replay_baselines WHERE game_id=?", (game_id,)
         ).fetchone()
@@ -117,7 +117,7 @@ def test_v4_migration_only_adds_structure_and_preserves_history(tmp_path):
     assert backup.exists()
     backup_bytes = backup.read_bytes()
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
         after = {
             table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in before

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>灰区事务所 · C01 本地切片</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -14,17 +15,21 @@
     </div>
     <div class="system-state">
       <span class="status-dot" aria-hidden="true"></span>
-      模拟模型 · 无网络调用
+      <span id="model-state">正在检测模型状态</span>
     </div>
   </header>
 
   <main>
     <section id="entry-panel" class="entry-panel" aria-labelledby="entry-title">
-      <p class="section-index">CASEWORK / C01</p>
+      <p class="section-index">CASEWORK / LOCAL</p>
       <h2 id="entry-title">打开事务所</h2>
-      <p class="entry-copy">这是 C01《不存在的人》的本地可玩切片。程序掌握案件真相、线索、地点和时钟；叙事文字由本地确定性模拟生成，不调用任何 AI Provider。</p>
+      <p class="entry-copy">这是《灰区事务所》的本地可玩切片。程序掌握案件真相、线索、地点和时钟；叙事文字由当前模型生成，在线 Provider 不可用时回退本地确定性模拟。</p>
       <div class="entry-grid">
         <form id="new-game-form" class="entry-form">
+          <label for="case-select">选择案件</label>
+          <select id="case-select" name="case-select">
+            <option value="C01">C01《不存在的人》</option>
+          </select>
           <label for="protagonist">主人公姓名</label>
           <div class="inline-control">
             <input id="protagonist" name="protagonist" value="江逢" maxlength="40" required>
@@ -52,6 +57,7 @@
           <span id="save-status">已自动保存</span>
           <code id="game-id"></code>
           <button id="copy-id" class="text-button" type="button">复制编号</button>
+          <button id="director-toggle" class="text-button" type="button" hidden>情节导演：关</button>
           <button id="return-entry" class="text-button" type="button">切换存档</button>
         </div>
       </div>
@@ -80,13 +86,19 @@
           <section class="context-block">
             <p class="section-index">可见状态</p>
             <ul class="state-list">
+              <li><span>案件</span><strong id="case-title">C01 · 不存在的人</strong></li>
               <li><span>位置</span><strong id="case-location">OC-01</strong></li>
               <li><span>阶段</span><strong id="case-phase">未接单</strong></li>
-              <li><span>项目清理</span><strong id="case-clock">0 / 4</strong></li>
+              <li><span id="case-clock-label">项目清理</span><strong id="case-clock">0 / 4</strong></li>
               <li><span>游戏内时间</span><strong id="case-world-time">0</strong></li>
               <li><span>已判定</span><strong id="roll-count">0 次</strong></li>
               <li><span>状态版本</span><strong id="case-revision">0</strong></li>
             </ul>
+          </section>
+          <section class="context-block">
+            <p class="section-index">城市切片</p>
+            <p id="city-time" class="board-note">第 1 日 · 清晨</p>
+            <ul id="city-positions" class="city-list"></ul>
           </section>
           <section class="context-block">
             <p class="section-index">证据</p>
@@ -179,6 +191,18 @@
           </div>
           <div id="replay-result" class="replay-result" aria-live="polite"></div>
           <div id="timeline-list" class="timeline-list"></div>
+        </div>
+      </section>
+
+      <section class="audit-dock" aria-labelledby="branches-title">
+        <div class="column-heading">
+          <h2 id="branches-title">分支存档</h2>
+          <button id="toggle-branches" class="text-button" type="button" aria-expanded="false">查看分支</button>
+        </div>
+        <div id="branch-panel" hidden>
+          <p class="audit-note">分支由历史行动确定性重放生成，原存档只读；归档只改状态，数据保留且可恢复。</p>
+          <p id="branch-error" class="error" role="alert"></p>
+          <div id="branch-list" class="branch-list"></div>
         </div>
       </section>
     </section>

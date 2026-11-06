@@ -8,6 +8,7 @@ import uuid
 
 from app.action_protocol import IdempotencyConflict, RULES_VERSION, StateConflict
 from app.case_content import CONTENT_VERSION
+from app.city_schedule import build_offscreen_payload
 
 
 class Database:
@@ -45,7 +46,7 @@ class Database:
                 raise
 
     def initialize(self) -> "Database":
-        """在事务中创建或迁移到版本 6，并启用 WAL。"""
+        """在事务中创建或迁移到版本 7，并启用 WAL。"""
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -75,6 +76,10 @@ class Database:
             self._backup_before_v5()
         if has_game_table and version < 6:
             self._backup_before_v6()
+        if has_game_table and version < 7:
+            self._backup_before_v7()
+        if has_game_table and version < 8:
+            self._backup_before_v8()
         schema = (
             """
             CREATE TABLE IF NOT EXISTS games (
@@ -83,6 +88,13 @@ class Database:
                 location TEXT NOT NULL,
                 seed INTEGER NOT NULL,
                 roll_count INTEGER NOT NULL DEFAULT 0,
+                case_id TEXT NOT NULL DEFAULT 'C01',
+                parent_game_id TEXT REFERENCES games(id),
+                fork_action_id TEXT,
+                fork_action_index INTEGER,
+                branch_label TEXT,
+                branch_status TEXT NOT NULL DEFAULT 'active',
+                branch_created_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """,
@@ -272,7 +284,7 @@ class Database:
                 self._backfill_v3(conn)
             if needs_v4_backfill:
                 self._backfill_v4(conn)
-            conn.execute("PRAGMA user_version=6")
+            conn.execute("PRAGMA user_version=8")
         return self
 
     def _backup_before_v2(self) -> None:
@@ -294,6 +306,14 @@ class Database:
     def _backup_before_v6(self) -> None:
         """保留首次升级到 v6 前的一致性快照。"""
         self._backup("pre-v6")
+
+    def _backup_before_v7(self) -> None:
+        """保留首次升级到 v7 前的一致性快照。"""
+        self._backup("pre-v7")
+
+    def _backup_before_v8(self) -> None:
+        """保留首次升级到 v8 前的一致性快照。"""
+        self._backup("pre-v8")
 
     def _backup(self, label: str) -> None:
         """使用 SQLite 在线备份；临时文件完成后原子替换目标。"""
@@ -338,6 +358,29 @@ class Database:
         if "world_time" not in case_columns:
             conn.execute(
                 "ALTER TABLE case_states ADD COLUMN world_time INTEGER NOT NULL DEFAULT 0"
+            )
+        game_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(games)").fetchall()
+        }
+        if "case_id" not in game_columns:
+            # v7 只补一列；旧档全部按 C01 继续运行。
+            conn.execute(
+                "ALTER TABLE games ADD COLUMN case_id TEXT NOT NULL DEFAULT 'C01'"
+            )
+        # v8 分支元数据：旧档作为根存档，分支状态默认 active。
+        branch_additions = {
+            "parent_game_id": "TEXT",
+            "fork_action_id": "TEXT",
+            "fork_action_index": "INTEGER",
+            "branch_label": "TEXT",
+            "branch_created_at": "TEXT",
+        }
+        for name, sql_type in branch_additions.items():
+            if name not in game_columns:
+                conn.execute(f"ALTER TABLE games ADD COLUMN {name} {sql_type}")
+        if "branch_status" not in game_columns:
+            conn.execute(
+                "ALTER TABLE games ADD COLUMN branch_status TEXT NOT NULL DEFAULT 'active'"
             )
         knowledge_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(knowledge_records)").fetchall()
@@ -501,34 +544,42 @@ class Database:
                 ),
             )
 
-    def create_game(self, protagonist: str) -> dict:
-        """创建新档，并在同一事务写入开场、案件投影与回放基线。"""
+    def create_game(self, protagonist: str, case=None) -> dict:
+        """按案件创建新档，并在同一事务写入开场、案件投影与回放基线。"""
         # 延迟导入避免存储模块与回放模块在加载时形成循环依赖。
+        from app.case_registry import default_case
         from app.replay_engine import canonical_json, make_initial_snapshot, snapshot_hash
 
+        bundle = case or default_case()
         game_id = uuid.uuid4().hex
-        opening = "雨敲着事务所的旧窗。唐葵坐在案件板旁，桌上的终端还亮着。你可以查看现场、检查终端，或和她谈谈。"
-        snapshot_json = canonical_json(make_initial_snapshot(protagonist))
+        snapshot_json = canonical_json(make_initial_snapshot(protagonist, bundle))
         with self.transaction() as conn:
             conn.execute(
-                "INSERT INTO games(id, protagonist, location, seed) VALUES (?, ?, ?, ?)",
-                (game_id, protagonist, "OC-01", 20261103),
+                "INSERT INTO games(id, protagonist, location, seed, case_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (game_id, protagonist, bundle.start_location, 20261103, bundle.case_id),
             )
             cursor = conn.execute(
                 "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, NULL, ?, ?)",
-                (game_id, "game_started", json.dumps({"text": opening}, ensure_ascii=False)),
+                (
+                    game_id,
+                    "game_started",
+                    json.dumps(
+                        {"text": bundle.opening, "case_id": bundle.case_id},
+                        ensure_ascii=False,
+                    ),
+                ),
             )
-            from app.case_content import initial_cognition
-            for record in initial_cognition(game_id, cursor.lastrowid):
+            for record in bundle.initial_cognition(game_id, cursor.lastrowid):
                 self._insert_knowledge_record(
                     conn, game_id, cursor.lastrowid, record
                 )
             conn.execute(
                 """
                 INSERT INTO case_states(game_id, phase, location, clock, clues_json, ending, revision)
-                VALUES (?, 'unoffered', 'OC-01', 0, '[]', NULL, 0)
+                VALUES (?, ?, ?, 0, '[]', NULL, 0)
                 """,
-                (game_id,),
+                (game_id, bundle.start_phase, bundle.start_location),
             )
             conn.execute(
                 """
@@ -538,7 +589,7 @@ class Database:
                 ) VALUES (?, ?, 1, ?, ?, ?)
                 """,
                 (
-                    game_id, snapshot_json, RULES_VERSION, CONTENT_VERSION,
+                    game_id, snapshot_json, RULES_VERSION, bundle.content_version,
                     snapshot_hash(snapshot_json),
                 ),
             )
@@ -576,6 +627,14 @@ class Database:
             {**dict(row), "payload": json.loads(row["payload_json"])}
             for row in rows
         ]
+
+    def count_actions(self, game_id: str) -> int:
+        """返回存档已提交的行动条数，作为城市时段推进的节拍。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM actions WHERE game_id=?", (game_id,)
+            ).fetchone()
+        return int(row["total"])
 
     def get_case_facts(self, game_id: str) -> list[dict]:
         """读取事实及来源事件类型；失效历史仍保留。"""
@@ -811,6 +870,7 @@ class Database:
         audit: dict | None = None,
         structured_changes: dict | None = None,
         expected_decision_context_hash: str | None = None,
+        director: dict | None = None,
     ) -> dict:
         """事务内复核版本、随机序号和决策上下文，再提交全部领域状态。"""
         action_id = uuid.uuid4().hex
@@ -829,6 +889,10 @@ class Database:
             game = conn.execute("SELECT * FROM games WHERE id=?", (game_id,)).fetchone()
             if game is None:
                 raise KeyError("存档不存在")
+            # 事务内按存档案件解析固定内容，隔离两案行动与场景。
+            from app.case_registry import get_case
+
+            bundle = get_case(game["case_id"] if game["case_id"] else "C01")
             current_case = conn.execute(
                 "SELECT * FROM case_states WHERE game_id=?", (game_id,)
             ).fetchone()
@@ -884,6 +948,19 @@ class Database:
                     ),
                 ),
             )
+            # 只有已接受提案才写事件；与行动共用同一事务，拒绝时不产生部分写入。
+            if director is not None and director.get("accepted"):
+                from app.director import director_event_payload
+
+                conn.execute(
+                    "INSERT INTO events(game_id, action_id, kind, payload_json) VALUES (?, ?, ?, ?)",
+                    (
+                        game_id,
+                        action_id,
+                        "director_beat",
+                        json.dumps(director_event_payload(director), ensure_ascii=False),
+                    ),
+                )
             if structured_changes is not None:
                 self._apply_structured_changes(
                     conn,
@@ -949,6 +1026,17 @@ class Database:
                         ),
                     ),
                 )
+            # 城市时段按行动条数推进：每次提交都记录一条有界公开日程摘要。
+            schedule_index = conn.execute(
+                "SELECT COUNT(*) FROM actions WHERE game_id=?", (game_id,)
+            ).fetchone()[0]
+            offscreen = build_offscreen_payload(schedule_index)
+            if offscreen is not None:
+                conn.execute(
+                    "INSERT INTO events(game_id, action_id, kind, payload_json) "
+                    "VALUES (?, ?, 'offscreen_activity', ?)",
+                    (game_id, action_id, json.dumps(offscreen, ensure_ascii=False)),
+                )
             if structured_changes is not None:
                 self._apply_social_changes(
                     conn, game_id, action_id, structured_changes.get("social", {})
@@ -961,7 +1049,7 @@ class Database:
                     structured_changes.get("world_time", {}).get("after", 0),
                 )
                 self._apply_scene_changes(
-                    conn, game_id, action_id, structured_changes.get("scenes", [])
+                    conn, game_id, action_id, structured_changes.get("scenes", []), bundle
                 )
         return self.get_action(game_id, action_id)
 
@@ -1324,9 +1412,9 @@ class Database:
         game_id: str,
         action_id: str,
         scenes: list[dict],
+        case,
     ) -> None:
         """只持久化固定场景的公开选择事实，不保存评分或私密知识。"""
-        from app.case_content import CONTENT_VERSION, SCENE_DEFINITIONS
         from app.action_protocol import RULES_VERSION
 
         expected_keys = {
@@ -1337,7 +1425,7 @@ class Database:
             if set(scene) != expected_keys:
                 raise ValueError("场景事件字段不完整或包含未声明字段")
             definition = next(
-                (item for item in SCENE_DEFINITIONS if item["scene_id"] == scene["scene_id"]),
+                (item for item in case.scene_definitions if item["scene_id"] == scene["scene_id"]),
                 None,
             )
             if definition is None or any(
@@ -1345,7 +1433,10 @@ class Database:
                 for key in ("plan_id", "candidate_id", "channel", "presentation_key")
             ):
                 raise ValueError("场景事件与固定内容定义不一致")
-            if scene["rules_version"] != RULES_VERSION or scene["content_version"] != CONTENT_VERSION:
+            if (
+                scene["rules_version"] != RULES_VERSION
+                or scene["content_version"] != case.content_version
+            ):
                 raise ValueError("场景事件版本与当前规则不一致")
             conn.execute(
                 "INSERT INTO events(game_id, action_id, kind, payload_json) "
@@ -1560,7 +1651,7 @@ class Database:
         response = self._pending_response(action)
         response.update({"status": "complete", "narrative": narrative})
         audit = action["audit"]
-        if audit.get("audit_version") in {1, 2, 3}:
+        if audit.get("audit_version") in {1, 2, 3, 4}:
             audit = {**audit, "status": "complete"}
         with self.transaction() as conn:
             cursor = conn.execute(

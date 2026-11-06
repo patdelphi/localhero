@@ -9,9 +9,11 @@ const state = {
   pendingNarrativeId: null,
   auditOpen: false,
   timelineOpen: false,
+  branchesOpen: false,
   replayBusy: false,
   replayAvailable: true,
   editingHypothesisId: null,
+  directorEnabled: false,
 };
 
 const elements = {
@@ -47,6 +49,18 @@ const elements = {
   hypothesisError: document.querySelector("#hypothesis-error"),
   submitHypothesis: document.querySelector("#submit-hypothesis"),
   cancelHypothesis: document.querySelector("#cancel-hypothesis"),
+  modelState: document.querySelector("#model-state"),
+  saveStatus: document.querySelector("#save-status"),
+  directorToggle: document.querySelector("#director-toggle"),
+  caseSelect: document.querySelector("#case-select"),
+  caseTitle: document.querySelector("#case-title"),
+  clockLabel: document.querySelector("#case-clock-label"),
+  cityTime: document.querySelector("#city-time"),
+  cityPositions: document.querySelector("#city-positions"),
+  toggleBranches: document.querySelector("#toggle-branches"),
+  branchPanel: document.querySelector("#branch-panel"),
+  branchList: document.querySelector("#branch-list"),
+  branchError: document.querySelector("#branch-error"),
 };
 
 const phaseLabels = {
@@ -123,6 +137,18 @@ async function api(path, options = {}) {
   return payload;
 }
 
+/** 只读展示当前模型来源；失败时保持未知状态，不影响游戏操作。 */
+async function loadModelState() {
+  try {
+    const health = await api("/api/health");
+    elements.modelState.textContent = health.model === "provider"
+      ? `在线模型 · ${health.provider} / ${health.model_name}`
+      : "本地模拟模型 · 无网络调用";
+  } catch (error) {
+    elements.modelState.textContent = "模型状态未知";
+  }
+}
+
 function setBusy(busy, label = "等待输入") {
   elements.submit.disabled = busy;
   elements.retry.disabled = busy;
@@ -187,6 +213,16 @@ function renderEvent(event) {
   } else if (event.kind === "scene_activated") {
     label.textContent = "远程场景";
     body.textContent = publicSceneText(event.payload);
+  } else if (event.kind === "director_beat") {
+    article.classList.add("director-event");
+    label.textContent = "情节节拍";
+    body.textContent = event.payload.text || "环境出现新的公开变化";
+  } else if (event.kind === "offscreen_activity") {
+    // 离屏事件只展示公开日程摘要，不追加任何玩家认知。
+    label.textContent = "城市动态";
+    const items = (event.payload.items || [])
+      .map((item) => `${item.name}在${item.location_name}${item.activity}`);
+    body.textContent = `第 ${event.payload.day} 日 · ${event.payload.slot_label}｜${items.join("；")}`;
   } else {
     label.textContent = "场景";
     body.textContent = event.payload.text || "事件已记录";
@@ -210,8 +246,10 @@ function renderRoll(roll) {
 function renderCase(caseState) {
   document.querySelector("#location-index").textContent = `LOCATION / ${caseState.location}`;
   document.querySelector("#location-name").textContent = caseState.location_name;
+  elements.caseTitle.textContent = `${caseState.case_id} · ${caseState.case_title}`;
   document.querySelector("#case-location").textContent = `${caseState.location} · ${caseState.district}`;
   document.querySelector("#case-phase").textContent = phaseLabels[caseState.phase] || caseState.phase;
+  elements.clockLabel.textContent = caseState.clock_label;
   document.querySelector("#case-clock").textContent = `${caseState.clock} / ${caseState.clock_max}`;
   document.querySelector("#case-world-time").textContent = caseState.world_time;
   document.querySelector("#case-ending").textContent = caseState.ending || "尚未结案";
@@ -229,6 +267,13 @@ function renderCase(caseState) {
     caseState.clues.forEach((clue) => {
       const item = document.createElement("li");
       item.textContent = clue.label;
+      // 跨案线索追加来源标记，避免玩家把两案证据混为一谈。
+      if (clue.cross_case) {
+        const badge = document.createElement("span");
+        badge.className = "cross-case-badge";
+        badge.textContent = `跨案 ${clue.cross_case.case_id}`;
+        item.appendChild(badge);
+      }
       clueList.appendChild(item);
     });
   }
@@ -408,8 +453,65 @@ async function loadGame(gameId) {
   elements.sceneLog.replaceChildren(...data.events.map(renderEvent));
   elements.sceneLog.lastElementChild?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   await loadCaseBoard();
+  await loadCity();
+  await loadDirectorState();
   if (state.auditOpen) await loadAudit();
   if (state.timelineOpen) await loadTimeline();
+  if (state.branchesOpen) await loadBranches();
+}
+
+/** 读取城市切片；失败时只提示，不影响案件行动。 */
+async function loadCity() {
+  try {
+    const data = await api(`/api/games/${state.gameId}/city`);
+    elements.cityTime.textContent = `第 ${data.city.day} 日 · ${data.city.slot_label}`;
+    elements.cityPositions.replaceChildren();
+    data.positions.forEach((item) => {
+      const entry = document.createElement("li");
+      const who = document.createElement("strong");
+      who.textContent = item.name;
+      const where = document.createElement("span");
+      where.textContent = `${item.location_name} · ${item.district}`;
+      const activity = document.createElement("small");
+      activity.textContent = item.activity;
+      entry.append(who, where, activity);
+      elements.cityPositions.appendChild(entry);
+    });
+  } catch (error) {
+    elements.cityTime.textContent = `城市切片读取失败：${error.message}`;
+    elements.cityPositions.replaceChildren();
+  }
+}
+
+/** 读取当前存档的导演开关；失败时隐藏入口，不影响游戏。 */
+async function loadDirectorState() {
+  try {
+    const data = await api(`/api/games/${state.gameId}/director`);
+    state.directorEnabled = data.enabled;
+    elements.directorToggle.hidden = false;
+    elements.directorToggle.textContent = `情节导演：${data.enabled ? "开" : "关"}`;
+    elements.directorToggle.setAttribute("aria-pressed", String(data.enabled));
+  } catch (error) {
+    elements.directorToggle.hidden = true;
+  }
+}
+
+async function loadCases() {
+  // 案件目录由后端注册表提供，前端不写死可选案件。
+  try {
+    const data = await api("/api/cases");
+    const current = elements.caseSelect.value;
+    elements.caseSelect.replaceChildren();
+    data.items.forEach((item) => {
+      const option = document.createElement("option");
+      option.value = item.case_id;
+      option.textContent = `${item.case_id}《${item.title}》`;
+      elements.caseSelect.appendChild(option);
+    });
+    if (current) elements.caseSelect.value = current;
+  } catch (error) {
+    elements.entryError.textContent = `案件目录读取失败：${error.message}`;
+  }
 }
 
 async function createGame(event) {
@@ -417,9 +519,10 @@ async function createGame(event) {
   elements.entryError.textContent = "";
   try {
     const protagonist = document.querySelector("#protagonist").value;
+    const caseId = elements.caseSelect.value;
     const game = await api("/api/games", {
       method: "POST",
-      body: JSON.stringify({ protagonist }),
+      body: JSON.stringify({ protagonist, case_id: caseId }),
     });
     await loadGame(game.id);
   } catch (error) {
@@ -623,6 +726,22 @@ function renderAudit(entries) {
       ...autonomy.scenes.map((item) => `场景：${publicSceneText(item)}`),
     ];
     if (autonomyLines.length) auditSection(details, "NPC回应与场景", autonomyLines);
+    if (audit.director) {
+      const director = audit.director;
+      const trigger = director.trigger || {};
+      const proposal = director.proposal;
+      const validation = director.validation;
+      auditSection(details, "情节导演", [
+        `触发：${trigger.checked ? "已检查" : "未检查"} · ${trigger.rule_id || "未定义"} · 间隔 ${trigger.actions_since_last ?? 0}/${trigger.interval ?? 0}`,
+        proposal
+          ? `提案：${proposal.source} · ${proposal.beat_type} → ${proposal.effect_id} · ${proposal.reason}`
+          : "提案：无",
+        validation
+          ? `校验：${validation.accepted ? "接受" : "拒绝"} · ${validation.rule_id} · ${validation.reason}`
+          : "校验：未执行",
+        director.effect ? `效果：${director.effect.text}` : "效果：无",
+      ]);
+    }
     auditSection(details, "关联事件", entry.events.map(
       (event) => `#${event.id} ${event.kind}`,
     ));
@@ -653,6 +772,7 @@ function timelineEventText(event) {
     return `局部推进：${event.changes?.join("；") || "固定事项已到期"}`;
   }
   if (event.kind === "scene_activated") return publicSceneText(event);
+  if (event.kind === "director_beat") return `情节节拍：${event.text || "环境出现新的公开变化"}`;
   if (event.kind === "narrative_completed") return event.text || "叙事已完成";
   if (event.kind.startsWith("legacy_")) return "旧档迁移记录（未补造历史）";
   return "行动已提交";
@@ -720,6 +840,8 @@ function renderTimeline(data) {
         article.appendChild(roll);
       }
       item.events.forEach((event) => {
+        // 叙事正文已在下方单独渲染，避免同一条完成事件重复显示。
+        if (item.narrative && event.kind === "narrative_completed") return;
         const text = document.createElement("p");
         text.textContent = timelineEventText(event);
         article.appendChild(text);
@@ -729,6 +851,8 @@ function renderTimeline(data) {
         narrative.textContent = item.narrative;
         article.appendChild(narrative);
       }
+      const controls = document.createElement("div");
+      controls.className = "timeline-controls";
       const verify = document.createElement("button");
       verify.type = "button";
       verify.className = "text-button";
@@ -736,7 +860,14 @@ function renderTimeline(data) {
       verify.textContent = "校验至此";
       verify.disabled = state.replayBusy || !state.replayAvailable;
       verify.addEventListener("click", () => verifyReplay(item.action_id));
-      article.appendChild(verify);
+      // 任意已记录行动都可以作为分叉点，分支会在新存档中重放该行动之前的历史。
+      const fork = document.createElement("button");
+      fork.type = "button";
+      fork.className = "text-button";
+      fork.textContent = "从此分叉";
+      fork.addEventListener("click", () => createBranchFrom(item.action_id));
+      controls.append(verify, fork);
+      article.appendChild(controls);
     } else {
       heading.textContent = "旧档迁移";
       const text = document.createElement("p");
@@ -751,6 +882,103 @@ function renderTimeline(data) {
 async function loadTimeline() {
   const data = await api(`/api/games/${state.gameId}/timeline`);
   renderTimeline(data);
+}
+
+/** 汇总分支节点的关键状态，便于在树上直接比较。 */
+function branchStateText(item) {
+  const state = item.state;
+  const parts = [
+    `行动 ${state.actions}`,
+    `状态版本 ${state.revision}`,
+    `位置 ${state.location}`,
+    `线索 ${state.clues}`,
+  ];
+  if (state.ending) parts.push(`结局：${state.ending}`);
+  return parts.join(" · ");
+}
+
+function renderBranches(data) {
+  elements.branchList.replaceChildren();
+  data.items.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = "branch-item";
+    if (item.is_current) card.classList.add("branch-current");
+    if (item.branch_status === "archived") card.classList.add("branch-archived");
+
+    const heading = document.createElement("h3");
+    heading.textContent = item.is_root
+      ? "根存档"
+      : item.branch_label || `分支 ${item.game_id.slice(0, 8)}`;
+    const meta = document.createElement("small");
+    const origin = item.is_root ? "起点" : `分叉于第 ${item.fork_action_index} 个行动之后`;
+    const status = item.branch_status === "archived" ? "已归档" : "进行中";
+    meta.textContent = `${origin} · ${status} · ${branchStateText(item)}`;
+    const reference = document.createElement("code");
+    reference.textContent = item.game_id;
+    card.append(heading, meta, reference);
+
+    const controls = document.createElement("div");
+    controls.className = "branch-controls";
+    if (!item.is_current && item.branch_status !== "archived") {
+      const switchButton = document.createElement("button");
+      switchButton.type = "button";
+      switchButton.className = "text-button";
+      switchButton.textContent = "切换至此";
+      switchButton.addEventListener("click", () => loadGame(item.game_id));
+      controls.appendChild(switchButton);
+    }
+    if (!item.is_root) {
+      const statusButton = document.createElement("button");
+      statusButton.type = "button";
+      statusButton.className = "text-button";
+      statusButton.textContent = item.branch_status === "archived" ? "恢复" : "归档";
+      statusButton.addEventListener("click", () => changeBranchStatus(item));
+      controls.appendChild(statusButton);
+    }
+    card.appendChild(controls);
+    elements.branchList.appendChild(card);
+  });
+}
+
+async function loadBranches() {
+  try {
+    const data = await api(`/api/games/${state.gameId}/branches`);
+    renderBranches(data);
+  } catch (error) {
+    elements.branchError.textContent = `分支读取失败：${error.message}`;
+  }
+}
+
+/** 从时间线行动创建分支，成功后直接进入新分支；名称使用服务端默认编号。 */
+async function createBranchFrom(actionId) {
+  elements.branchError.textContent = "";
+  try {
+    const data = await api(`/api/games/${state.gameId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ fork_action_id: actionId }),
+    });
+    await loadGame(data.game.id);
+    await loadBranches();
+  } catch (error) {
+    elements.branchError.textContent = `创建分支失败：${error.message}`;
+    elements.branchError.scrollIntoView({ block: "nearest" });
+  }
+}
+
+/** 归档或恢复分支；用户必须先在浏览器确认，服务端也会再次校验 confirm。 */
+async function changeBranchStatus(item) {
+  const action = item.branch_status === "archived" ? "恢复" : "归档";
+  if (!window.confirm(`确认${action}分支“${item.branch_label || item.game_id}”？`)) return;
+  elements.branchError.textContent = "";
+  try {
+    const path = item.branch_status === "archived"
+      ? `/api/games/${item.game_id}/branch/restore`
+      : `/api/games/${item.game_id}/branch/archive`;
+    await api(path, { method: "POST", body: JSON.stringify({ confirm: true }) });
+    await loadBranches();
+  } catch (error) {
+    elements.branchError.textContent = `${action}分支失败：${error.message}`;
+  }
 }
 
 async function verifyReplay(throughActionId = null) {
@@ -788,6 +1016,20 @@ elements.actionInput.addEventListener("input", () => {
   clearPreview();
 });
 elements.retry.addEventListener("click", retryNarrative);
+elements.directorToggle.addEventListener("click", async () => {
+  try {
+    const data = await api(`/api/games/${state.gameId}/director`, {
+      method: "POST",
+      body: JSON.stringify({ enabled: !state.directorEnabled }),
+    });
+    state.directorEnabled = data.enabled;
+    elements.directorToggle.textContent = `情节导演：${data.enabled ? "开" : "关"}`;
+    elements.directorToggle.setAttribute("aria-pressed", String(data.enabled));
+    elements.saveStatus.textContent = `情节导演已${data.enabled ? "开启" : "关闭"}（仅本次运行）`;
+  } catch (error) {
+    elements.actionError.textContent = error.message;
+  }
+});
 elements.toggleAudit.addEventListener("click", async () => {
   state.auditOpen = !state.auditOpen;
   elements.auditPanel.hidden = !state.auditOpen;
@@ -814,6 +1056,13 @@ elements.toggleTimeline.addEventListener("click", async () => {
     }
   }
 });
+elements.toggleBranches.addEventListener("click", async () => {
+  state.branchesOpen = !state.branchesOpen;
+  elements.branchPanel.hidden = !state.branchesOpen;
+  elements.toggleBranches.setAttribute("aria-expanded", String(state.branchesOpen));
+  elements.toggleBranches.textContent = state.branchesOpen ? "收起分支" : "查看分支";
+  if (state.branchesOpen) await loadBranches();
+});
 elements.verifyLatest.addEventListener("click", () => verifyReplay());
 document.querySelector("#copy-id").addEventListener("click", async () => {
   try {
@@ -830,6 +1079,8 @@ document.querySelector("#return-entry").addEventListener("click", () => {
 });
 
 // 页面刷新后尝试恢复上次存档；失败时保留手动读取入口。
+loadModelState();
+loadCases();
 const savedGameId = localStorage.getItem("grey-zone-game-id");
 if (savedGameId) {
   loadGame(savedGameId).catch(() => {

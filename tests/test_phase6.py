@@ -144,7 +144,7 @@ def test_v6_new_game_has_declared_initial_cognition_without_new_case_facts(tmp_p
     assert inference["source_record_id"] is not None
     assert db.get_case_facts(game_id) == []
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(knowledge_records)")
         }
@@ -311,7 +311,7 @@ def test_v5_migration_preserves_legacy_unknown_and_does_not_backfill_initial_gra
     Database(db.path).initialize()
     assert db.path.with_name(f"{db.path.name}.pre-v6.bak").exists()
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
         rows = conn.execute(
             "SELECT * FROM knowledge_records WHERE game_id=?", (game_id,)
         ).fetchall()

@@ -624,3 +624,347 @@ trae 不要提交，自己判断哪些应该提交、哪些不提交，并更新
 ### 未执行事项
 
 未执行 Git push，未接入 AI Provider，未修改真实存档内容。
+
+## 2026-11-05T15:29:25+08:00 — 第七阶段：在线 AI Provider 接入
+
+### 用户请求
+
+开始第七阶段；使用根目录 `.env` 中的在线与本地 Provider，优先 DashScope，用于调试与推进项目。
+
+### 变更内容
+
+新增 `app/provider_config.py` 与 `app/llm_model.py`，在线模型负责意图解析与叙事：解析只接受合法行动编号，失败回退 `SimulatedModel`；叙事只使用已提交事实与固定要点，失败进入待重试。`app/main.py` 按 `.env` 构建模型，健康接口只返回 Provider 与模型名。新增第七阶段设计与 10 项专项测试；`.env` 已加入 `.gitignore`。
+
+### 验证结果
+
+全量 pytest **119 passed**；`compileall` 与 `git diff --check` 通过；DashScope 真实冒烟成功（`qwen3.7-plus`，意图解析正确，叙事 61 字）。
+
+### 未执行事项
+
+未执行 Git commit／push，未修改真实存档，未接入流式输出或多 Provider 路由。
+
+## 2026-11-05T16:07:44+08:00 — 第七阶段真实联调验收
+
+### 用户请求
+
+真实联调验收。
+
+### 验证内容
+
+使用临时库 `%TEMP%\localhero-phase7-browser-20261105-e7a1c3.db` 与 `127.0.0.1:8765` 服务，在真实浏览器完成接委托、询问细节、安抚、前往新栖公寓、查看住处五步。健康接口返回 `provider=dashscope`、`model_name=qwen3.7-plus`；已存叙事与 `SimulatedModel` 固定文本不同，确认在线叙事实际生效。两次读取存档摘要一致；审计 5 条均为 `complete`；回放校验 `matched`；刷新后视图一致；控制台无脚本错误。核对认知记录确认，来源事件 #6 的“精度未知”证词是既有固定声明（无来源记录），符合“旧证词不回溯改写”的约定。
+
+### 修复内容
+
+顶部模型状态改为读取 `/api/health` 动态显示当前 Provider；入口说明移除“不调用任何 AI Provider”的过期表述；历史时间线不再重复渲染同一条叙事；补充空 favicon 以消除控制台 404。
+
+### 验证结果
+
+全量 pytest **119 passed**；`node --check app/static/app.js` 通过；浏览器复核显示“在线模型 · dashscope / qwen3.7-plus”，时间线叙事只出现一次，回放结果“一致”。真实 `data/games.db` 未被联调修改（SHA-256 `16DFB15E0318CB67B974340358FFA98FC2EC4DCBD8A846C2416874A885CBAA7F`）。
+
+### 未执行事项
+
+未执行 Git commit／push；未优化叙事提示词（在线叙事仍高度贴近固定要点，列为后续质量项）；未改动真实存档。
+
+## 2026-11-05T16:28:48+08:00 — 优化叙事扩写能力
+
+### 用户请求
+
+先优化叙事扩写能力。
+
+### 修改内容
+
+重写 `app/llm_model.py` 的叙事提示词：把“固定要点”明确为不可照抄的事实边界；允许补充环境光线、声音、气味、温度、材质、身体感受和动作节奏等不改事实的感官细节；补充中文判定结果与行动倾向；保留禁止新增人物、地点、物品、线索、数值、时间与判定结果的约束。新增 `tests/test_phase7.py::test_narrate_prompt_treats_reference_as_boundary` 契约测试。
+
+### 真实冒烟
+
+DashScope `qwen3.7-plus` 两个样例：
+- 前往新栖公寓：6-gram 重合度 0.04，叙事补充了坡道水泥、指示光与呼吸节奏。
+- 查看方笙住处（有代价成功）：6-gram 重合度 0.00，叙事补充了积灰、滑轨摩擦声与颈椎隐痛，未新增线索或结论。
+
+### 验证结果
+
+第七阶段专项 **11 项通过**；全量 **120 项通过**；`compileall` 通过。
+
+### 未执行事项
+
+未执行 Git commit／push；未改动真实存档；未启动浏览器复验（本次仅后端叙事提示词变更）。
+
+## 2026-11-05T16:39:34+08:00 — 后续开发阶段规划
+
+### 用户请求
+
+多规划几个后续开发阶段，以便持续开发。
+
+### 产出
+
+新建 `Docs/design/2026-11-05-roadmap-phase8-13.md`，规划第八至第十三阶段：叙事上下文与人物口吻、AI 受限情节演进、C02 与跨案关联、持续 NPC 日程与城市切片、分支存档与推演、产品化与部署。每阶段包含目标、范围、交付物、验收标准、边界与依赖，并给出推荐顺序与立即可执行项。
+
+### 验证结果
+
+文档为 UTF-8 BOM 与 CRLF；`current-status.md` 已增加路线图导航链接。
+
+### 未执行事项
+
+未开始任何阶段实施；未执行 Git commit／push；未修改代码与真实存档。
+
+## 2026-11-05T16:52:25+08:00 — 第八阶段：叙事上下文与人物口吻
+
+### 用户请求
+
+自动推进后续开发阶段，先完成第八阶段。
+
+### 修改内容
+
+- 新建 `app/narrative_context.py`：从已提交事件、案件公开状态与玩家认知构建白名单上下文，包含最近三次行动、当前地点、在场人物、上一条叙事结尾与玩家已知线索；提供固定人物口吻档案、字符 6-gram 相似度检测与优先级裁剪。
+- 修改 `app/llm_model.py`：`narrate` 新增可选 `context` 与 `previous_narratives`；连续叙事相似度超过 0.35 时重试一次，仍重复则回退固定要点；提示词增加上下文、口吻和非重复约束。
+- 修改 `app/model.py`：`SimulatedModel.narrate` 接受相同可选参数并忽略，保持确定性测试兼容。
+- 修改 `app/game.py`：每次叙事前重建并裁剪上下文，把最近两条叙事交给模型。
+- 新建 `tests/test_phase8.py`：覆盖公开白名单、私密真相隔离、最近行动上限、上下文裁剪、重复检测、重试回退与游戏服务接入。
+- 新建 `Docs/design/2026-11-05-narrative-context-phase8-design.md`，同步 `current-status.md` 与 `todo.md`。
+
+### 验证结果
+
+第八阶段专项 **10 项通过**；全量 **130 项通过**；Python `compileall -q app tests` 通过。
+
+### 未执行事项
+
+未执行 DashScope 真实叙事冒烟；未执行浏览器复验；未执行 Git commit／push；未修改真实存档。
+## 2026-11-05T17:11:S+08:00 — 第九阶段：AI 受限情节演进
+
+### 用户请求
+
+按路线图继续执行后续开发阶段（第九阶段）。
+
+### 修改内容
+
+- 新建 `app/director.py`：定义单一 `environment_complication` 节拍、固定效果白名单、触发冷却、同档去重、理由/目标/机械变化校验，以及审计与事件负载校验；关闭时返回空，不改变第八阶段结构。
+- 修改 `app/game.py`：接入情节导演评估、会话内开关与配置读取；接受提案交给同一行动事务提交。
+- 修改 `app/store.py`：`commit_action` 支持导演段，接受时同事务写入 `director_beat` 事件；`complete_action` 兼容审计 v4。
+- 修改 `app/replay_engine.py`：只重放已保存的导演结论，新增事件白名单校验与 `director_beats` 快照比较。
+- 修改 `app/action_pipeline.py`：审计在导演开启时升级为 v4。
+- 修改 `app/llm_model.py`、`app/model.py`：新增在线与模拟提案能力，模型只能选择白名单效果编号。
+- 修改 `app/main.py`、`app/provider_config.py`：新增导演配置读取与 `GET/POST /api/games/{id}/director`。
+- 修改 `app/static/index.html`、`app.js`、`style.css`：新增情节导演会话开关、情节节拍事件与审计段落展示。
+- 新建 `tests/test_phase9.py`（16 项）与 `Docs/design/2026-11-05-director-proposal-phase9-design.md`；同步 `current-status.md`、`todo.md`。
+
+### 验证结果
+
+第九阶段专项 **16 项通过**；全量 **146 项通过**；Python `compileall -q app tests` 与 JavaScript `node --check app/static/app.js` 通过。
+
+### 未执行事项
+
+未执行浏览器复验与 DashScope 真实提案冒烟；未执行 Git commit／push；未修改真实存档。
+## 2026-11-05T17:11:S+08:00 — 第九阶段浏览器复验与冒烟
+
+### 用户请求
+
+先做浏览器复验和冒烟测试。
+
+### 执行方式
+
+- 使用 `%TEMP%\grey_zone_phase9_verify.db` 临时存档启动本地服务，端口 8019，`AI_DIRECTOR_INTERVAL=2`；未触碰真实 `data/games.db`。
+- Dashboard 模型为 `provider / dashscope / qwen3.7-plus`，4 次行动均调用真实 DashScope：意图解析、叙事生成与情节提案。
+
+### 浏览器复验结果
+
+- 新建存档并开启情节导演：按钮显示“情节导演：开”，请求 `POST /api/games/{id}/director` 返回 200。
+- 第 3 次行动触发节拍：提案 `provider · environment_complication → env.light_flicker`，审计显示“触发：已检查 · director.trigger_ready · 间隔 2/2”“校验：接受 · director.accepted”，事件流出现“情节节拍：顶灯短暂闪了一下，阴影在墙面挪动。”
+- 时间线末条包含“情节节拍”；审计关联事件包含 `#9 director_beat`。
+- 页面重载后事件与导演开关状态保留（开关仅本次进程有效）。
+- 关闭导演后第 4 次行动审计为 v3，无“情节导演”段落，无新增节拍事件。
+- 页面无业务 JavaScript 错误；控制台仅有浏览器扩展探测 `%40vite/client` 的 404 与旧端口连接失败噪声。
+
+### 冒烟结果
+
+- `GET /api/health` 返回 200。
+- `POST /api/games/{id}/replay/verify` 返回 `status=matched`、`checked_actions=4`，包含已接受节拍。
+- 复验服务已停止。
+
+### 文档同步
+
+- 更新 `Docs/design/current-status.md` 与 `Docs/design/todo.md`；本次未改代码。
+
+## 2026-11-05 20:43:05 第十阶段实施（C02 与跨案关联）
+
+### 用户指令
+
+- 开始第十阶段。
+
+### 实施内容
+
+- 新增 pp/case_registry.py，以 CaseBundle 包装 C01 与 C02 固定内容；C01 内容版本保持 c01-1.3。
+- 新增 pp/case_c02.py：4 个地点、完整行动链、三种结局、独立时钟与跨案线索。
+- schema 升级 v7：games.case_id 默认 C01，升级前备份 pre-v7。
+- 操作管线、存储、回放、导演与叙事上下文改为按存档案件解析。
+- 新增 GET /api/cases；新档支持 case_id；前端增加案件选择、案件标题与跨案线索标记。
+
+### 验证结果
+
+- 新增 	ests/test_phase10.py 10 项，全量 156 项通过。
+- python -m compileall、
+ode --check app/static/app.js、git diff --check 通过。
+- 浏览器验收：临时库与模拟模型下新建 C02 存档，案件名称与时钟标签正确；首次委托行动提交后时间线与线索更新。
+
+### 未执行事项
+
+- 未执行 Git commit / push / merge / pull。
+- 未修改真实 data/games.db。
+- 验收服务已停止；临时文件待确认后清理。
+
+## 2026-11-05 第十一阶段实施（持续 NPC 日程与城市切片）
+
+### 用户指令
+
+- 删除临时目录并继续第十一阶段。
+- 确认时间节拍按行动次数推进，城市位置面板仅展示公开日程。
+
+### 实施内容
+
+- 新增 app/city_schedule.py：四段时段、13 个城市切片地点、十二名持续 NPC 的四段固定日程与有界离屏摘要。
+- 城市时间以存档行动条数为节拍，每天四段；私密行程（沈见微、夜间加班与私单）不进入玩家视图。
+- commit_action 每次行动在同一事务写入一条 offscreen_activity 事件，最多三条公开条目，不写认知、不带事实字段。
+- 回放白名单接纳 offscreen_activity；公开摘要字段纳入时间线与场景日志。
+- 新增 GET /api/games/{game_id}/city；前端新增“城市切片”面板与“城市动态”事件条目。
+
+### 验证结果
+
+- 新增 tests/test_phase11.py 10 项，全量 166 项通过。
+- python -m compileall、node --check app/static/app.js、git diff --check 通过。
+- 浏览器验收：临时库下新建 C01 存档显示第 1 日清晨；提交“询问委托细节”后显示第 1 日白天、列表刷新；全程无沈见微；场景日志出现“城市动态”。
+
+### 未执行事项
+
+- 未执行 Git commit / push / merge / pull。
+- 未修改真实 data/games.db，未执行数据库迁移。
+- 验收服务已停止，临时验收数据库已删除。
+
+## 2026-11-05 22:11:21 +08:00
+
+### 用户请求
+
+好的，开始第十二阶段。
+
+### 实施内容
+
+- app/store.py：schema v8，为 games 增加 parent_game_id、fork_action_id、fork_action_index、branch_label、branch_status、branch_created_at；升级前备份 pre-v8，旧档默认 active 且无父存档。
+- app/replay_engine.py：新增 rebuild_prefix，从任意已记录行动确定性重放前缀；恢复基线时补写 replay_baselines，仅复制 narrative_completed 展示事件，机械事件由重放生成。
+- 新增 app/branching.py：分支创建、软删除归档、恢复与分支树；直属分支上限 10，分支树节点上限 40，失败时单事务清理半成品。
+- app/game.py 与 app/main.py：新增创建、列表、归档、恢复四个分支接口；归档与恢复必须显式 confirm，根存档禁止归档。
+- 前端：时间线每个行动新增“从此分叉”；新增“分支存档”面板，展示分支树与关键状态摘要，支持切换、归档与恢复。
+- 新增 tests/test_phase12.py 12 项；同步更新既有 user_version 断言 7→8。
+
+### 验证结果
+
+- 第十二阶段专项 12 项通过，全量 178 项测试通过。
+- python compileall、node --check app/static/app.js、git diff --check 通过。
+- 浏览器验收 6 项全部 PASS：加载存档、从第 2 个行动分叉、分支树与状态对比、归档、恢复、切回根存档。
+- 新建 Docs/design/2026-11-05-branching-phase12-design.md，并更新 current-status、todo、路线图。
+
+### 未执行事项
+
+- 未执行 Git commit / push / merge / pull。
+- 未修改真实 data/games.db，未执行真实库迁移。
+- 验收服务已停止；临时验收数据库 C:\Users\patde\AppData\Local\Temp\grey_zone_phase12_verify.db 仍在，等待确认后删除。
+
+## 2026-11-06 08:10:20 +08:00
+
+### 用户请求
+
+好的，按本地一键脚本方案开始第十三阶段。
+
+### 实施内容
+
+- 新增 app/logging_setup.py：逐行 JSON 日志写入 data/logs/app.jsonl，单文件 5 MB 滚动保留 3 份，异常附堆栈；密钥不进入日志。
+- app/llm_model.py：Provider 统计请求数、最终失败、本地回退、累计与最近耗时；parse_action 与导演回退计数；_chat 用 try/finally 记录成功与失败。
+- app/model.py：SimulatedModel.stats() 返回零统计，健康接口在离线时结构稳定。
+- app/main.py：build_model 支持 GREY_ZONE_OFFLINE 强制离线；create_app 增加 offline/log_dir/log_level 参数，版本 1.0.0；健康接口扩展模型来源、离线状态、schema 版本、数据库状态与统计；新增导出与导入接口。
+- app/replay_engine.py：新增 export_records / import_records，抽出 _apply_prefix 供分支重建与导入复用。
+- 新增 app/archive.py：在线备份与 quick_check、确认式恢复（安全副本、清理 -wal/-shm）、单存档导出与导入（确定性重放重建、失败清理半成品）。
+- 新增 tools/save_tool.py：backup / restore / export / import 命令行工具。
+- 新增 start.ps1、start.bat、.env.example：dev／prod 配置档，开发档默认离线，可 -Offline 强制模拟；支持端口、存档路径、安装依赖与打开浏览器；start.ps1 为 UTF-8 BOM。
+- requirements.txt 增加 httpx；新增 Docs/deployment.md 与 Docs/release-notes.md。
+- 新增 tests/test_phase13.py 11 项。
+
+### 验证结果
+
+- 第十三阶段专项 11 项通过，全量 189 项测试通过。
+- python compileall、node --check app/static/app.js、git diff --check 通过。
+- 干净环境 start.ps1 -Profile dev -Port 8023 使用临时库启动，健康接口 offline=true、schema_version=8、database=ok。
+- 临时库完成 C01 十一行动至 phase=closed、6 条线索；原始 JSON 导出后导入新库，导出存档回放 matched；命令行备份与导出导入成功。
+
+### 未执行事项
+
+- 未执行 Git commit / push / merge / pull。
+- 未修改真实 data/games.db，真实库仍为 v6，未执行 v8 迁移。
+- 验收服务已停止；临时库与导出文件仍在 %TEMP%，等待确认后删除。
+
+## 2026-11-06 09:08:18 +08:00
+
+### 用户请求
+
+先不删临时文件，直接迁移真实存档到 v8。
+
+### 实施内容
+
+- 迁移前使用 tools/save_tool.py 生成独立备份 data/backups/games-20261106-010743-051408.db，并记录迁移前 SHA-256。
+- 调用 Database("data/games.db").initialize() 完成 v7→v8 迁移；程序自动保留 data/games.db.pre-v8.bak。
+- 同步 current-status、release-notes 与 todo 中的真实存档版本描述。
+
+### 验证结果
+
+- user_version=8，PRAGMA quick_check=ok；games 3 个、actions 10 条、events 32 条均保留。
+- 三个旧档 case_id 均为 C01，branch_status 均为 active，parent_game_id 均为空（作为根存档）。
+- 迁移前 SHA-256 19D49ACD…2083F，迁移后 71222A2A…C08A9。
+- 三个旧档回放均按设计返回 unavailable / baseline_missing（缺 v5 初始基线），公开历史不受影响。
+
+### 未执行事项
+
+- 未删除任何临时文件（按用户要求保留）。
+- 未执行 Git commit / push / merge / pull。
+
+## 2026-11-06 09:16:36 +08:00
+
+### 用户请求
+
+启动服务做页面复验。
+
+### 实施内容
+
+- 使用 .\start.ps1 -Profile dev -Port 8024 启动服务，读取真实 data/games.db，离线模拟模型。
+
+### 验证结果
+
+- 健康接口返回 status=ok、model=simulated、offline=true、schema_version=8、database=ok、统计全零。
+- 浏览器填入真实存档编号 8f3c883e… 后进入游戏：存档编号、C01《不存在的人》、历史事件与城市切片（第 1 日时段、多个人物位置）均正常，控制台无报错。
+- 分支存档面板展开显示根存档“进行中 · 当前”；展开“历史时间线”后 7 张行动卡片均含“校验至此”与“从此分叉”，校验按钮因缺基线禁用，符合预期。
+- 全程未提交行动、未分叉、未归档、未编辑假设；服务停止后复查 games 3、actions 10、events 32、分支 0，user_version=8，quick_check=ok。
+- 服务已停止，监听 8024 端口已关闭。
+
+### 未执行事项
+
+- 未删除临时文件。
+- 未执行 Git commit / push / merge / pull。
+- 未修改真实存档内容。
+
+## 2026-11-06 10:34:05 +08:00
+
+### 用户请求
+
+好的，执行吧。（经确认：清理临时文件、Git 提交并推送、补充 .gitignore）
+
+### 实施内容
+
+- .gitignore 增加 data/backups/ 与 data/logs/，避免提交运行时备份与日志。
+- 删除 %TEMP% 下 3 个验收数据库与 3 个导出 JSON，含第十二阶段遗留的 grey_zone_phase12_verify.db。
+- 提交并推送第十三阶段及此前未提交的阶段代码、测试与文档。
+
+### 验证结果
+
+- 临时文件删除后复查 TEMP 无匹配残留。
+- 提交前全量测试仍为 189 项通过（本次仅改文档与忽略规则）。
+- 提交后工作区无未提交变更，推送成功。
+
+### 未执行事项
+
+- 未修改真实 data/games.db。
+- 未执行数据库迁移或部署。

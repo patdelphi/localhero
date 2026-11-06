@@ -31,7 +31,8 @@ def test_health_and_complete_action_flow(tmp_path):
     loaded = client.get(f"/api/games/{game_id}")
     assert loaded.status_code == 200
     assert loaded.json()["game"]["id"] == game_id
-    assert len(loaded.json()["events"]) == 3
+    # 开场、行动、案件变化与城市离屏摘要各一条。
+    assert len(loaded.json()["events"]) == 4
 
 
 def test_narrative_failure_can_be_retried(tmp_path):

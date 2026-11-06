@@ -102,8 +102,8 @@ def test_request_id_reuse_with_different_hash_is_conflict(tmp_path):
         service.act(game["id"], "拒绝委托", "same-request")
 
     assert len(db.get_audit(game["id"])) == 1
-    # 开场、行动、案件变化、社会变化、叙事各一条；冲突请求没有新增事件。
-    assert len(db.get_events(game["id"])) == 5
+    # 开场、行动、案件变化、社会变化、城市离屏摘要、叙事各一条；冲突请求没有新增事件。
+    assert len(db.get_events(game["id"])) == 6
 
 
 def test_committed_action_has_complete_trace_and_event_links(tmp_path):
@@ -129,6 +129,7 @@ def test_committed_action_has_complete_trace_and_event_links(tmp_path):
     assert audit["state_revision"] == {"before": 0, "after": 0}
     assert {event["kind"] for event in entry["events"]} == {
         "action_committed",
+        "offscreen_activity",
         "narrative_completed",
     }
 
@@ -190,7 +191,7 @@ def test_legacy_database_migrates_with_explicit_audit_gap(tmp_path):
     assert (tmp_path / "legacy.db.pre-v3.bak").exists()
     assert (tmp_path / "legacy.db.pre-v5.bak").exists()
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(actions)").fetchall()
         }
@@ -271,7 +272,8 @@ def test_stale_preview_returns_conflict_before_revalidation(tmp_path):
     assert first.status_code == 200
     assert stale.status_code == 409
     assert "状态" in stale.json()["detail"]
-    assert len(client.get(f"/api/games/{game_id}").json()["events"]) == 8
+    # 两次成功行动各新增一条城市离屏摘要，因此事件总数从 8 变为 10。
+    assert len(client.get(f"/api/games/{game_id}").json()["events"]) == 10
     assert len(client.get(f"/api/games/{game_id}/audit").json()["items"]) == 2
 
 

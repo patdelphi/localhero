@@ -18,8 +18,8 @@ from app.action_protocol import (
     StateConflict,
     make_request_hash,
 )
-from app.case_content import CONTENT_VERSION, initial_cognition
 from app.case_engine import action_by_id, initial_state
+from app.case_registry import CaseBundle, get_case
 from app.npc_decision import decision_context_hash
 from app.rules import classify_roll
 from app.store import Database
@@ -46,16 +46,20 @@ def snapshot_hash(snapshot_json: str) -> str:
     return hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
 
 
-def make_initial_snapshot(protagonist: str) -> dict:
-    """构造 v5 新档的空历史机械基线。"""
+def make_initial_snapshot(
+    protagonist: str,
+    case: CaseBundle | None = None,
+) -> dict:
+    """构造 v5 新档的空历史机械基线，未传案件时保持 C01 旧结构。"""
+    bundle = case or get_case("C01")
     return {
         "game": {
             "protagonist": protagonist,
-            "location": "OC-01",
+            "location": bundle.start_location,
             "seed": 20261103,
             "roll_count": 0,
         },
-        "case": initial_state(),
+        "case": initial_state(bundle),
         "facts": [],
         "clock_changes": [],
         "knowledge": [],
@@ -177,6 +181,7 @@ class ReplayEngine:
             return self._unavailable(self._public_baseline(None), through_action_id, exc)
 
         baseline = self._public_baseline(records["baseline"])
+        bundle = get_case(records["game"].get("case_id") or "C01")
         actions = records["actions"]
         if through_action_id is None:
             target_count = len(actions)
@@ -192,13 +197,13 @@ class ReplayEngine:
         prefix = actions[:target_count]
 
         try:
-            snapshot = self._validate_baseline(records["baseline"])
+            snapshot = self._validate_baseline(records["baseline"], bundle)
             self._validate_events(records, target_count)
             if len(prefix) > self.max_actions:
                 raise ReplayUnavailable(
                     "replay_budget_exceeded", "目标前缀超过单次回放行动上限"
                 )
-            rolls = self._validate_actions(prefix)
+            rolls = self._validate_actions(prefix, bundle)
         except ReplayUnavailable as exc:
             return self._unavailable(baseline, through_action_id, exc)
 
@@ -210,7 +215,7 @@ class ReplayEngine:
             # keeper 保证所有 Database 短连接关闭后，命名内存库仍然存活。
             keeper = sqlite3.connect(uri, uri=True)
             memory = Database(uri).initialize()
-            self._restore_baseline(memory, game_id, snapshot)
+            self._restore_baseline(memory, game_id, snapshot, bundle)
 
             for index, action in enumerate(prefix, 1):
                 if self.clock() > deadline:
@@ -226,24 +231,28 @@ class ReplayEngine:
                 roll = rolls[index - 1]
                 try:
                     plan = prepare_recorded_action(
-                        command, action["intent"], case, social, plans, decision_context
+                        command, action["intent"], case, social, plans, decision_context,
+                        bundle,
                     )
                     if not plan["can_submit"]:
                         return self._mismatch(
                             baseline, through_action_id, checked, action, index,
                             [{"path": "permission.can_submit", "expected": True, "actual": False}],
                         )
-                    next_case = apply_plan(plan, case, roll)
+                    next_case = apply_plan(plan, case, roll, bundle)
                     structured = None
                     if plan["case_action"]:
-                        content = action_by_id(plan["intent"]["action_id"])
+                        content = action_by_id(plan["intent"]["action_id"], bundle)
                         structured = build_structured_changes(
                             content, case, roll["outcome"] if roll else "no_roll", social, plans,
-                            decision_context,
+                            decision_context, bundle,
                         )
                     context_hash = decision_context_hash(decision_context)
+                    # 只重放已保存的导演结论，不重新询问模型。
+                    director = (action.get("audit") or {}).get("director")
                     audit = make_audit(
-                        plan, game, case, roll, next_case, structured, context_hash
+                        plan, game, case, roll, next_case, structured, context_hash,
+                        director, bundle,
                     )
                     memory.commit_action(
                         game_id,
@@ -264,6 +273,7 @@ class ReplayEngine:
                         audit=audit,
                         structured_changes=structured,
                         expected_decision_context_hash=context_hash,
+                        director=director,
                     )
                 except (PermissionDenied, StateConflict, ValueError):
                     return self._mismatch(
@@ -301,6 +311,149 @@ class ReplayEngine:
         finally:
             if keeper is not None:
                 keeper.close()
+
+    def rebuild_prefix(
+        self, database: Database, target_game_id: str, game_id: str, through_action_id: str
+    ) -> dict:
+        """把源存档在指定行动之前的历史重建到目标存档。
+
+        返回源行动到新行动的编号映射与需复制的展示类事件；不读取模型。
+        调用方负责失败后的补偿清理，本方法只做确定性写入。
+        """
+        records = self._extract(game_id)
+        bundle = get_case(records["game"].get("case_id") or "C01")
+        actions = records["actions"]
+        target_count = next(
+            (index for index, action in enumerate(actions, 1)
+             if action["id"] == through_action_id),
+            None,
+        )
+        if target_count is None:
+            raise KeyError("目标行动不存在")
+        prefix = actions[:target_count]
+        snapshot = self._validate_baseline(records["baseline"], bundle)
+        self._validate_events(records, target_count)
+        if len(prefix) > self.max_actions:
+            raise ReplayUnavailable(
+                "replay_budget_exceeded", "目标前缀超过单次重建行动上限"
+            )
+        rolls = self._validate_actions(prefix, bundle)
+
+        self._restore_baseline(database, target_game_id, snapshot, bundle)
+        return self._apply_prefix(
+            database, target_game_id, records, prefix, rolls, bundle
+        )
+
+    def import_records(self, database: Database, target_game_id: str, records: dict) -> dict:
+        """从导出记录重建完整存档；不读取源库、不调用模型。
+
+        调用方负责新存档编号与失败补偿；记录必须来自 export_records。
+        """
+        if not isinstance(records, dict):
+            raise ValueError("导出记录结构不合法")
+        game = records.get("game")
+        actions = records.get("actions")
+        events = records.get("events")
+        if not isinstance(game, dict) or not isinstance(actions, list) or not isinstance(events, list):
+            raise ValueError("导出记录缺少存档、行动或事件")
+        if len(actions) > self.max_actions:
+            raise ReplayUnavailable(
+                "replay_budget_exceeded", "导入存档超过单次重建行动上限"
+            )
+        try:
+            bundle = get_case(game.get("case_id") or "C01")
+        except KeyError as exc:
+            raise ValueError("导出记录包含未知案件编号") from exc
+        snapshot = self._validate_baseline(records.get("baseline"), bundle)
+        self._validate_events(records, len(actions))
+        rolls = self._validate_actions(actions, bundle)
+        self._restore_baseline(database, target_game_id, snapshot, bundle)
+        return self._apply_prefix(
+            database, target_game_id, records, list(actions), rolls, bundle
+        )
+
+    def export_records(self, game_id: str) -> dict:
+        """在只读事务中导出一致性记录，供备份与迁移使用。"""
+        return self._extract(game_id)
+
+    def _apply_prefix(
+        self, database: Database, target_game_id: str, records: dict,
+        prefix: list[dict], rolls: list[dict | None], bundle,
+    ) -> dict:
+        """把已验证的行动前缀逐条重放到目标存档，并返回编号映射。"""
+        deadline = self.clock() + self.timeout_seconds
+        for index, action in enumerate(prefix, 1):
+            if self.clock() > deadline:
+                raise ReplayUnavailable(
+                    "replay_budget_exceeded", "分支重建单调时钟期限已耗尽", action, index
+                )
+            game = database.get_game(target_game_id)
+            case = database.get_case_state(target_game_id)
+            social = database.get_social_states(target_game_id)
+            plans = database.get_local_plans(target_game_id)
+            decision_context = database.get_decision_context(target_game_id)
+            command = action["command"]
+            roll = rolls[index - 1]
+            plan = prepare_recorded_action(
+                command, action["intent"], case, social, plans, decision_context,
+                bundle,
+            )
+            if not plan["can_submit"]:
+                raise ValueError("分叉点的历史行动在当时不可提交")
+            next_case = apply_plan(plan, case, roll, bundle)
+            structured = None
+            if plan["case_action"]:
+                content = action_by_id(plan["intent"]["action_id"], bundle)
+                structured = build_structured_changes(
+                    content, case, roll["outcome"] if roll else "no_roll",
+                    social, plans, decision_context, bundle,
+                )
+            context_hash = decision_context_hash(decision_context)
+            director = (action.get("audit") or {}).get("director")
+            audit = make_audit(
+                plan, game, case, roll, next_case, structured, context_hash,
+                director, bundle,
+            )
+            database.commit_action(
+                target_game_id,
+                f"replay:{index}",
+                command["text"],
+                action["intent"],
+                roll,
+                next_case,
+                request_hash=make_request_hash(target_game_id, command),
+                expected_revision=(
+                    case["revision"]
+                    if command.get("expected_revision") is None
+                    else command["expected_revision"]
+                ),
+                expected_roll_count=game["roll_count"],
+                command=command,
+                declaration=plan["declaration"],
+                audit=audit,
+                structured_changes=structured,
+                expected_decision_context_hash=context_hash,
+                director=director,
+            )
+
+        source_actions = {action["id"] for action in prefix}
+        # 机械事件已由重放重新生成，只复制模型产出的叙事文本，避免重复写入。
+        source_events = [
+            event for event in records["events"]
+            if event["action_id"] in source_actions
+            and event["kind"] == "narrative_completed"
+        ]
+        with database.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, request_id FROM actions WHERE game_id=?", (target_game_id,)
+            ).fetchall()
+        new_by_request = {row["request_id"]: row["id"] for row in rows}
+        action_map = {
+            action["id"]: new_by_request[f"replay:{index}"]
+            for index, action in enumerate(prefix, 1)
+        }
+        return {"action_map": action_map, "events": source_events}
+
 
     def _extract(self, game_id: str) -> dict:
         """在强制只读连接的单一事务中取得一致性历史快照。"""
@@ -412,11 +565,17 @@ class ReplayEngine:
             "narrative_completed": ("text",),
             "legacy_v3_backfill": ("phase", "location", "clock", "world_time", "clues", "ending", "revision"),
             "legacy_v4_backfill": ("world_time", "relationship"),
+            "director_beat": (
+                "beat_type", "effect_id", "text", "target_action",
+                "proposal_id", "source",
+            ),
+            # 城市离屏摘要只公开时段与公开活动，不含认知或隐藏事实。
+            "offscreen_activity": ("day", "slot_index", "slot_label", "items"),
         }.get(kind, ())
         return {"kind": kind, **{key: payload.get(key) for key in allowed}}
 
     @staticmethod
-    def _validate_baseline(row: dict | None) -> dict:
+    def _validate_baseline(row: dict | None, case: CaseBundle) -> dict:
         """校验基线哈希、格式、版本和必要机械领域。"""
         if row is None:
             raise ReplayUnavailable("baseline_missing", "旧档缺少初始基线，仅可查看历史")
@@ -424,7 +583,7 @@ class ReplayEngine:
             raise ReplayUnavailable("baseline_hash_mismatch", "初始快照哈希不一致")
         if row["snapshot_format"] != 1:
             raise ReplayUnavailable("unsupported_snapshot", "不支持的初始快照格式")
-        if row["rules_version"] != RULES_VERSION or row["content_version"] != CONTENT_VERSION:
+        if row["rules_version"] != RULES_VERSION or row["content_version"] != case.content_version:
             raise ReplayUnavailable("unsupported_version", "当前程序不支持基线声明的版本")
         try:
             snapshot = json.loads(row["snapshot_json"])
@@ -451,16 +610,46 @@ class ReplayEngine:
         return snapshot
 
     @staticmethod
-    def _validate_actions(actions: list[dict]) -> list[dict | None]:
-        """在试算前校验所有命令、意图、版本和保存骰点。"""
+    def _validate_actions(
+        actions: list[dict],
+        case: CaseBundle,
+    ) -> list[dict | None]:
+        """在试算前校验所有命令、意图、版本、保存骰点与导演结论。"""
+        from app.director import MAX_BEATS_PER_GAME, validate_director_record
+
         rolls = []
+        accepted_beats = 0
         for index, action in enumerate(actions, 1):
-            if action.get("rules_version") != RULES_VERSION or action.get("content_version") != CONTENT_VERSION:
+            if (
+                action.get("rules_version") != RULES_VERSION
+                or action.get("content_version") != case.content_version
+            ):
                 raise ReplayUnavailable(
                     "unsupported_version", "行动声明的版本不受支持", action, index
                 )
             command = action.get("command")
             intent = action.get("intent")
+            audit = action.get("audit") or {}
+            director = audit.get("director")
+            if director is not None:
+                # 导演段只在 v4 审计中出现；结构或效果不一致即视为不可重放。
+                if audit.get("audit_version") != 4:
+                    raise ReplayUnavailable(
+                        "invalid_action_record", "导演段与审计版本不一致", action, index
+                    )
+                record = validate_director_record(director, intent or {})
+                if record["rule_id"] == "director.proposal_invalid" or (
+                    director.get("accepted") and not record["accepted"]
+                ):
+                    raise ReplayUnavailable(
+                        "invalid_action_record", "导演结论与白名单不一致", action, index
+                    )
+                if record["accepted"]:
+                    accepted_beats += 1
+                    if accepted_beats > MAX_BEATS_PER_GAME:
+                        raise ReplayUnavailable(
+                            "invalid_action_record", "同档情节节拍超过上限", action, index
+                        )
             valid = (
                 isinstance(command, dict)
                 and command.get("kind") == "action.submit"
@@ -477,7 +666,7 @@ class ReplayEngine:
                 )
             if intent["kind"] == "case_action":
                 try:
-                    content = action_by_id(intent.get("action_id"))
+                    content = action_by_id(intent.get("action_id"), case)
                 except KeyError as exc:
                     raise ReplayUnavailable(
                         "invalid_action_record", "案件行动定义不存在", action, index
@@ -523,9 +712,20 @@ class ReplayEngine:
         allowed = {
             "game_started", "action_committed", "case_changed", "social_changed",
             "local_simulation_advanced", "scene_activated", "narrative_completed",
+            "director_beat", "offscreen_activity",
         }
+        from app.director import validate_director_event_payload
+
         current_boundary = 0
         for event in records["events"]:
+            if event["kind"] == "director_beat":
+                # 事件负载必须与白名单完全一致，否则视为不可重放写入。
+                try:
+                    validate_director_event_payload(event.get("payload") or {})
+                except ValueError as exc:
+                    raise ReplayUnavailable(
+                        "invalid_action_record", "情节节拍事件与白名单不一致"
+                    ) from exc
             action_id = event["action_id"]
             if action_id is not None:
                 if action_id not in action_indexes:
@@ -543,16 +743,24 @@ class ReplayEngine:
                 )
 
     @staticmethod
-    def _restore_baseline(memory: Database, game_id: str, snapshot: dict) -> None:
-        """把已验证空历史基线恢复到内存库。"""
+    def _restore_baseline(
+        memory: Database,
+        game_id: str,
+        snapshot: dict,
+        case: CaseBundle,
+    ) -> None:
+        """把已验证空历史基线恢复到内存库，并写入所属案件与回放基线。"""
         game = snapshot["game"]
-        case = snapshot["case"]
+        state = snapshot["case"]
+        # 分支存档需要与实时新档完全相同的基线行，才能独立回放校验。
+        snapshot_json = canonical_json(snapshot)
         with memory.transaction() as conn:
             conn.execute(
-                "INSERT INTO games(id, protagonist, location, seed, roll_count) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO games(id, protagonist, location, seed, roll_count, case_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     game_id, game["protagonist"], game["location"], game["seed"],
-                    game["roll_count"],
+                    game["roll_count"], case.case_id,
                 ),
             )
             cursor = conn.execute(
@@ -560,7 +768,7 @@ class ReplayEngine:
                 (game_id,),
             )
             # 当前版本新档必须恢复与实时创建档完全相同的固定初始认知。
-            for record in initial_cognition(game_id, cursor.lastrowid):
+            for record in case.initial_cognition(game_id, cursor.lastrowid):
                 Database._insert_knowledge_record(
                     conn, game_id, cursor.lastrowid, record
                 )
@@ -572,9 +780,21 @@ class ReplayEngine:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    game_id, case["phase"], case["location"], case["clock"],
-                    case["world_time"], canonical_json(case["clues"]), case["ending"],
-                    case["revision"],
+                    game_id, state["phase"], state["location"], state["clock"],
+                    state["world_time"], canonical_json(state["clues"]), state["ending"],
+                    state["revision"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO replay_baselines(
+                    game_id, snapshot_json, snapshot_format,
+                    rules_version, content_version, snapshot_hash
+                ) VALUES (?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    game_id, snapshot_json, RULES_VERSION,
+                    case.content_version, snapshot_hash(snapshot_json),
                 ),
             )
 
@@ -757,6 +977,21 @@ class ReplayEngine:
             and event["action_id"] in action_indexes
             and action_indexes[event["action_id"]] <= boundary
         ]
+        director_beats = [
+            {
+                "source": source(event["id"]),
+                **{
+                    key: event["payload"].get(key) for key in (
+                        "beat_type", "effect_id", "text", "target_action",
+                        "proposal_id", "source",
+                    )
+                },
+            }
+            for event in records["events"]
+            if event["kind"] == "director_beat"
+            and event["action_id"] in action_indexes
+            and action_indexes[event["action_id"]] <= boundary
+        ]
         return {
             "game": game,
             "case": case,
@@ -767,6 +1002,7 @@ class ReplayEngine:
             "character_history": history,
             "local_plans": local_plans,
             "scenes": scenes,
+            "director_beats": director_beats,
         }
 
     @staticmethod

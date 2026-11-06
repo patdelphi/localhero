@@ -1,15 +1,19 @@
-"""程序说明：提供 C01 案件的初始状态、可用行动和确定性状态转换。"""
+"""程序说明：提供案件的初始状态、可用行动和确定性状态转换。
+
+默认案件为 C01；调用方可通过 case 参数切换到其他已注册案件。
+"""
 
 import copy
 
-from app.case_content import ACTIONS, CLUE_LABELS, ENDINGS, LOCATIONS
+from app.case_registry import CaseBundle, default_case
 
 
-def initial_state() -> dict:
-    """返回每个新存档共享的 C01 初始状态。"""
+def initial_state(case: CaseBundle | None = None) -> dict:
+    """返回指定案件的初始状态，未传案件时保持 C01 旧行为。"""
+    bundle = case or default_case()
     return {
-        "phase": "unoffered",
-        "location": "OC-01",
+        "phase": bundle.start_phase,
+        "location": bundle.start_location,
         "clock": 0,
         "world_time": 0,
         "clues": [],
@@ -18,15 +22,17 @@ def initial_state() -> dict:
     }
 
 
-def get_location(location_id: str) -> dict:
+def get_location(location_id: str, case: CaseBundle | None = None) -> dict:
     """返回地点显示信息，未知地点由调用层显式处理。"""
-    return LOCATIONS[location_id]
+    bundle = case or default_case()
+    return bundle.locations[location_id]
 
 
-def available_actions(state: dict) -> list[dict]:
+def available_actions(state: dict, case: CaseBundle | None = None) -> list[dict]:
     """根据当前地点、阶段和线索，返回玩家可见且合法的行动。"""
+    bundle = case or default_case()
     result = []
-    for action in ACTIONS:
+    for action in bundle.actions:
         if not _phase_matches(action, state):
             continue
         if not _location_matches(action, state):
@@ -58,23 +64,36 @@ def resolve_action(state: dict, action: dict, roll_outcome: str | None) -> dict:
     return next_state
 
 
-def action_by_id(action_id: str) -> dict:
-    """按固定行动编号读取内容，避免服务层到处重复定义行动。"""
-    for action in ACTIONS:
-        if action["id"] == action_id:
-            return action
-    raise KeyError("案件行动不存在")
+def action_by_id(action_id: str, case: CaseBundle | None = None) -> dict:
+    """按固定行动编号读取内容，未知编号抛 KeyError。"""
+    bundle = case or default_case()
+    return bundle.action(action_id)
 
 
-def public_state(state: dict, plans: list[dict] | None = None) -> dict:
+def public_state(
+    state: dict,
+    plans: list[dict] | None = None,
+    case: CaseBundle | None = None,
+) -> dict:
     """返回公开案件状态、时间和计划，不包含任何私密社会状态。"""
+    bundle = case or default_case()
+    clues = []
+    for clue in state["clues"]:
+        item = {"id": clue, "label": bundle.clue_labels[clue]}
+        # 跨案线索携带关联案件元数据，前端据此显示标记。
+        if clue in bundle.cross_case_links:
+            item["cross_case"] = bundle.cross_case_links[clue]
+        clues.append(item)
     return {
+        "case_id": bundle.case_id,
+        "case_title": bundle.title,
         "phase": state["phase"],
         "location": state["location"],
-        "location_name": LOCATIONS[state["location"]]["name"],
-        "district": LOCATIONS[state["location"]]["district"],
+        "location_name": bundle.locations[state["location"]]["name"],
+        "district": bundle.locations[state["location"]]["district"],
         "clock": state["clock"],
-        "clock_max": 4,
+        "clock_max": bundle.clock_max,
+        "clock_label": bundle.clock_label,
         "world_time": state.get("world_time", 0),
         "plans": [
             {
@@ -85,12 +104,12 @@ def public_state(state: dict, plans: list[dict] | None = None) -> dict:
             }
             for plan in (plans or [])
         ],
-        "clues": [{"id": clue, "label": CLUE_LABELS[clue]} for clue in state["clues"]],
-        "ending": ENDINGS.get(state["ending"]) if state["ending"] else None,
+        "clues": clues,
+        "ending": bundle.endings.get(state["ending"]) if state["ending"] else None,
         "revision": state.get("revision", 0),
         "actions": [
             {"id": action["id"], "label": action["label"]}
-            for action in available_actions(state)
+            for action in available_actions(state, bundle)
         ],
     }
 

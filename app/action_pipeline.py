@@ -3,13 +3,7 @@
 from copy import deepcopy
 
 from app.action_protocol import PermissionDenied, RULES_VERSION
-from app.case_content import (
-    ACTIONS,
-    ACTION_METADATA,
-    CLUE_LABELS,
-    CONTENT_VERSION,
-    KNOWLEDGE_DECLARATIONS,
-)
+from app.case_registry import CaseBundle, default_case
 from app.case_engine import action_by_id, resolve_action
 from app.cognition_engine import (
     assign_cognition_ids,
@@ -26,20 +20,24 @@ from app.social_engine import build_social_changes, judge_social_response
 class CaseAuthorizer:
     """独立审核事实作用域；模型或发起者不能自行授予权限。"""
 
-    def authorize(self, fact_proposal: dict, state: dict | None = None) -> dict:
+    def authorize(
+        self,
+        fact_proposal: dict,
+        state: dict | None = None,
+        case: CaseBundle | None = None,
+    ) -> dict:
         """只允许场景和固定案件提案，全球正典必须人工批准。"""
+        bundle = case or default_case()
         scope = fact_proposal.get("scope")
         if scope == "global_canon":
             raise PermissionDenied("全球正典只能经人工批准后修改")
         if scope == "case":
-            if state is None or fact_proposal.get("object") not in {
-                action["id"] for action in ACTIONS
-            }:
+            if state is None or fact_proposal.get("object") not in bundle.action_index:
                 raise PermissionDenied("案件事实缺少固定内容或状态依据")
             return {
                 "allowed": True,
                 "fact_level": "case",
-                "reason": "固定 C01 内容与前置条件审核通过",
+                "reason": f"固定 {bundle.case_id} 内容与前置条件审核通过",
             }
         if scope == "scene":
             return {
@@ -50,11 +48,12 @@ class CaseAuthorizer:
         raise PermissionDenied("未知事实作用域，不能自动提交")
 
 
-def candidate_actions(state: dict) -> list[dict]:
+def candidate_actions(state: dict, case: CaseBundle | None = None) -> list[dict]:
     """列出固定候选及逐项排除理由，供预览和审计共同使用。"""
+    bundle = case or default_case()
     result = []
     clues = set(state["clues"])
-    for action in ACTIONS:
+    for action in bundle.actions:
         reasons = []
         if state["phase"] not in action["phases"]:
             reasons.append("当前案件阶段不可用")
@@ -85,22 +84,24 @@ def prepare_action(
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
     decision_context: dict | None = None,
+    case: CaseBundle | None = None,
 ) -> dict:
     """生成不写库、不掷骰的行动计划，显式选择也必须通过 Check。"""
-    candidates = candidate_actions(state)
+    bundle = case or default_case()
+    candidates = candidate_actions(state, bundle)
     by_id = {candidate["action_id"]: candidate for candidate in candidates}
 
     if action_id is not None:
         if action_id not in by_id:
             raise PermissionDenied("宿主命令指定的行动不存在")
-        action = action_by_id(action_id)
+        action = action_by_id(action_id, bundle)
         intent = _case_intent(action)
         selected = by_id[action_id]
         selection_source = "host_command"
         selection_reason = "显式宿主命令选择替代计划"
     else:
         legal_actions = [
-            action_by_id(candidate["action_id"])
+            action_by_id(candidate["action_id"], bundle)
             for candidate in candidates
             if candidate["eligible"]
         ]
@@ -111,7 +112,7 @@ def prepare_action(
             action_id = intent["action_id"]
             if action_id not in by_id:
                 raise PermissionDenied("解析结果不是固定案件行动")
-            action = action_by_id(action_id)
+            action = action_by_id(action_id, bundle)
             selected = by_id[action_id]
         else:
             action = None
@@ -120,7 +121,7 @@ def prepare_action(
     return _complete_plan(
         state, intent, action_id, action, selected, candidates,
         selection_source, selection_reason, social_states, local_plans,
-        decision_context,
+        decision_context, bundle,
     )
 
 
@@ -131,9 +132,11 @@ def prepare_recorded_action(
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
     decision_context: dict | None = None,
+    case: CaseBundle | None = None,
 ) -> dict:
     """仅按已保存命令和意图重建计划，不解析文本、不调用模型。"""
-    candidates = candidate_actions(state)
+    bundle = case or default_case()
+    candidates = candidate_actions(state, bundle)
     by_id = {candidate["action_id"]: candidate for candidate in candidates}
     action_id = command.get("action_id")
     if intent.get("kind") == "case_action":
@@ -143,7 +146,7 @@ def prepare_recorded_action(
         action_id = recorded_id
         if action_id not in by_id:
             raise PermissionDenied("已记录行动不是固定案件行动")
-        action = action_by_id(action_id)
+        action = action_by_id(action_id, bundle)
         selected = by_id[action_id]
     else:
         if action_id is not None:
@@ -153,7 +156,7 @@ def prepare_recorded_action(
     return _complete_plan(
         state, intent, action_id, action, selected, candidates,
         "recorded_replay", "按已保存规范命令与意图重算",
-        social_states, local_plans, decision_context,
+        social_states, local_plans, decision_context, bundle,
     )
 
 
@@ -169,8 +172,10 @@ def _complete_plan(
     social_states: list[dict] | None,
     local_plans: list[dict] | None,
     decision_context: dict | None = None,
+    case: CaseBundle | None = None,
 ) -> dict:
     """共用候选、Check、声明和机械计划，确保实时行动与回放同规则。"""
+    bundle = case or default_case()
     eligible = selected["eligible"] if selected else True
     reason = None if eligible else "；".join(selected["excluded_reasons"])
     selected_id = action_id or intent["kind"]
@@ -184,6 +189,7 @@ def _complete_plan(
             "valid_when": "提交事务内状态版本与随机序号均未变化",
         },
         state,
+        bundle,
     )
     if not eligible:
         permission = {
@@ -229,9 +235,9 @@ def _complete_plan(
             "selection_source": selection_source,
             "selection_reason": selection_reason,
         },
-        "declaration": make_declaration(intent, action, state),
+        "declaration": make_declaration(intent, action, state, bundle),
         "mechanical_changes": preview_structured_changes(
-            action, state, social_states, local_plans, decision_context
+            action, state, social_states, local_plans, decision_context, bundle
         ),
         "pipeline": pipeline,
         "permission": permission,
@@ -239,8 +245,14 @@ def _complete_plan(
     }
 
 
-def make_declaration(intent: dict, action: dict | None, state: dict) -> dict:
+def make_declaration(
+    intent: dict,
+    action: dict | None,
+    state: dict,
+    case: CaseBundle | None = None,
+) -> dict:
     """生成掷骰前目标、处境、效果、代价与修正来源。"""
+    bundle = case or default_case()
     if action is None:
         requires_roll = intent["requires_roll"]
         return {
@@ -252,7 +264,7 @@ def make_declaration(intent: dict, action: dict | None, state: dict) -> dict:
             "modifier_source": "通用行动固定修正",
         }
 
-    metadata = ACTION_METADATA.get(action["id"], {})
+    metadata = bundle.action_metadata.get(action["id"], {})
     effects = list(action["effects"].values())
     adds_clue = any(effect.get("clues_add") for effect in effects)
     changes_state = any(
@@ -280,7 +292,7 @@ def make_declaration(intent: dict, action: dict | None, state: dict) -> dict:
         "position": "有风险，需要公开 2D6" if action["requires_roll"] else "平稳，无需掷骰",
         "effect": effect_text,
         "cost": "；".join(costs) if costs else "无机械代价",
-        "modifier_source": metadata.get("modifier_source", "C01 固定行动修正"),
+        "modifier_source": metadata.get("modifier_source", f"{bundle.case_id} 固定行动修正"),
     }
 
 
@@ -290,6 +302,7 @@ def preview_structured_changes(
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
     decision_context: dict | None = None,
+    case: CaseBundle | None = None,
 ) -> list[dict]:
     """按判定结果列出公开摘要，不暴露评分、知识引用或未激活场景。"""
     if action is None:
@@ -297,7 +310,7 @@ def preview_structured_changes(
     previews = []
     for outcome in action["effects"]:
         changes = build_structured_changes(
-            action, state, outcome, social_states, local_plans, decision_context
+            action, state, outcome, social_states, local_plans, decision_context, case
         )
         after_time = changes["world_time"]["after"]
         has_due_plan = any(
@@ -321,14 +334,16 @@ def build_structured_changes(
     social_states: list[dict] | None = None,
     local_plans: list[dict] | None = None,
     decision_context: dict | None = None,
+    case: CaseBundle | None = None,
 ) -> dict:
     """从固定内容计算玩家结果，再串行执行回应者、NPC决策和场景导演。"""
+    bundle = case or default_case()
     effect = action["effects"].get(outcome, {})
     new_clues = [clue for clue in effect.get("clues_add", []) if clue not in state["clues"]]
     facts = [
         {
             "fact_id": clue,
-            "subject_id": "C01",
+            "subject_id": bundle.case_id,
             "fact_kind": "clue",
             "visibility": "player",
             "mechanical": {"grants_action_permission": True},
@@ -340,7 +355,7 @@ def build_structured_changes(
             "holder_id": "player",
             "kind": "observation",
             "fact_id": clue,
-            "content": CLUE_LABELS[clue],
+            "content": bundle.clue_labels[clue],
             "accuracy": "direct",
             "visibility": "player",
             "source_record_id": None,
@@ -350,7 +365,7 @@ def build_structured_changes(
         }
         for clue in new_clues
     ]
-    for declaration in KNOWLEDGE_DECLARATIONS.get(action["id"], []):
+    for declaration in bundle.knowledge_declarations.get(action["id"], []):
         if outcome in declaration["outcomes"]:
             knowledge.append({
                 "source_record_id": None,
@@ -363,7 +378,7 @@ def build_structured_changes(
     clock = None
     if delta:
         clock = {
-            "clock_id": "project_cleanup",
+            "clock_id": bundle.clock_id,
             "reason": f"{action['id']}:{outcome}",
             "delta": delta,
             "before_value": state["clock"],
@@ -389,7 +404,9 @@ def build_structured_changes(
         )
     simulation, scenes, autonomy = _build_autonomy_changes(
         deepcopy(decision_context), social_states, local_plans, social, after_time,
-        "commission" in state["clues"] or action["id"] == "accept_commission",
+        (bundle.commission_clue in state["clues"]) or action["id"] == bundle.commission_action,
+        bundle.plan_scope,
+        bundle.local_plan_definitions,
     )
     if response is not None:
         autonomy["responses"].append(response)
@@ -444,18 +461,20 @@ def build_structured_changes(
 
 
 def _build_autonomy_changes(
-    context, social_states, local_plans, social, after_time, has_commission
+    context, social_states, local_plans, social, after_time,
+    has_commission, plan_scope, plan_definitions,
 ):
     """每个原到期计划只决策一次；新建立计划不在同一边界链式触发。"""
     simulation = advance_local_simulation(
-        after_time, social_states, local_plans, process_plans=False
+        after_time, social_states, local_plans, process_plans=False,
+        plan_scope=plan_scope, plan_definitions=plan_definitions,
     )
     autonomy = {"responses": [], "decisions": [], "scenes": []}
     scenes = []
     due_plans = sorted(
         (
             item for item in local_plans
-            if item["scope"] == "c01" and item["status"] == "pending"
+            if item["scope"] == plan_scope and item["status"] == "pending"
             and item["due_time"] <= after_time
         ),
         key=lambda item: (item["due_time"], item["plan_id"]),
@@ -491,11 +510,16 @@ def _build_autonomy_changes(
     return simulation, scenes, autonomy
 
 
-def apply_plan(plan: dict, state: dict, roll: dict | None) -> dict | None:
+def apply_plan(
+    plan: dict,
+    state: dict,
+    roll: dict | None,
+    case: CaseBundle | None = None,
+) -> dict | None:
     """纯计算主结果；没有案件变化时返回 None，After 不另造行动。"""
     if not plan["case_action"]:
         return None
-    action = action_by_id(plan["intent"]["action_id"])
+    action = action_by_id(plan["intent"]["action_id"], case)
     next_state = resolve_action(state, action, roll["outcome"] if roll else None)
     keys = ("phase", "location", "clock", "world_time", "clues", "ending")
     if all(next_state[key] == state[key] for key in keys):
@@ -511,8 +535,11 @@ def make_audit(
     next_state: dict | None,
     structured_changes: dict | None = None,
     decision_context_hash: str | None = None,
+    director: dict | None = None,
+    case: CaseBundle | None = None,
 ) -> dict:
-    """组成版本2完整内部审计；公开接口另行裁剪自主决策细节。"""
+    """组成完整内部审计；情节导演开启时升级为版本4。"""
+    bundle = case or default_case()
     after_revision = state["revision"] + (1 if next_state else 0)
     random_audit = None
     if roll:
@@ -533,10 +560,12 @@ def make_audit(
         "random_sequence_before": game["roll_count"],
         "random_sequence_after_player": game["roll_count"] + (1 if roll else 0),
     })
+    # 关闭情节导演时保持 v3 结构，与第八阶段完全一致。
+    audit_version = 3 if director is None else 4
     return {
-        "audit_version": 3,
+        "audit_version": audit_version,
         "rules_version": RULES_VERSION,
-        "content_version": CONTENT_VERSION,
+        "content_version": bundle.content_version,
         "candidates": plan["candidates"],
         "selected_action": plan["selected_action"],
         "pipeline": plan["pipeline"],
@@ -548,6 +577,7 @@ def make_audit(
         "random": random_audit,
         "state_revision": {"before": state["revision"], "after": after_revision},
         "status": "narrative_pending",
+        **({"director": director} if director is not None else {}),
     }
 
 

@@ -1,15 +1,19 @@
 """程序说明：以纯函数推进 C01 固定计划到期和短期社会状态结束。"""
 
-from app.case_content import LOCAL_PLAN_DEFINITIONS
-
-
 def advance_local_simulation(
     after_time: int,
     social_states: list[dict],
     local_plans: list[dict],
     process_plans: bool = True,
+    plan_scope: str = "c01",
+    plan_definitions: dict | None = None,
 ) -> dict:
     """处理固定到期事项；第五阶段可关闭计划直写，只保留短期状态结束。"""
+    if plan_definitions is None:
+        # 默认沿用 C01 固定内容，保持既有调用行为。
+        from app.case_content import LOCAL_PLAN_DEFINITIONS
+
+        plan_definitions = LOCAL_PLAN_DEFINITIONS
     result = {
         "plans": [],
         "states": [],
@@ -21,14 +25,14 @@ def advance_local_simulation(
         (
             item for item in local_plans
             if process_plans
-            and item["scope"] == "c01"
+            and item["scope"] == plan_scope
             and item["status"] == "pending"
             and item["due_time"] <= after_time
         ),
         key=lambda item: (item["due_time"], item["plan_id"]),
     )
     for plan in due_plans:
-        definition = LOCAL_PLAN_DEFINITIONS.get(plan["plan_id"])
+        definition = plan_definitions.get(plan["plan_id"])
         if definition is None:
             raise ValueError("到期计划缺少固定内容定义")
         result["plans"].append({"plan_id": plan["plan_id"], "status": "completed"})
